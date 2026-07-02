@@ -1,0 +1,1810 @@
+---
+title: "16S and chemistry analysis"
+author: "Emelie"
+date: "2023-08-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(viridis)
+library(tibble)
+library(vegan)
+library(ggfortify)
+library(ggiraphExtra)
+library(ggpubr)
+library(SRS)
+library(RColorBrewer)
+library(FSA)
+library(car)
+library(lme4)
+library(afex)
+library(ggrepel)
+library(ANCOMBC)
+library(phyloseq)
+library(microbiome)
+library(readODS)
+library(emmeans)
+```
+
+```{r summary ASVs DADA2}
+#summary_dada2 <- read_tsv("../data/16S_ampliseq/Ampliseq/Ampliseq/overall_summary.tsv")
+```
+
+```{r read in tables}
+#reading in data - sediment data here, bw at bottom since moved into supp
+sed_16S_counts <- read_tsv("../data/16S_ampliseq/Ampliseq/Ampliseq/dada2/DADA2_table.tsv", 
+                           col_types=cols(.default=col_double(), 
+                                          ASV_ID=col_character(), 
+                                          sequence=col_character())) %>%  
+  pivot_longer(c(2:82), 
+               names_to="sample", 
+               values_to="count") %>% 
+  dplyr::select(-sequence) %>% 
+  filter(count>0)
+
+sed_16S_counts$sample <- sub("P9908_", "X", sed_16S_counts$sample, fixed=TRUE)
+
+#taxonomy
+taxa <- read_tsv("../data/16S_ampliseq/Ampliseq/Ampliseq/dada2/ASV_tax_species.user.tsv", 
+                 col_types = cols(.default = col_character(), confidence = col_double()))
+
+##Unknown Cyanos on Genus level have been identified with pythoref as Cyanobacteria
+#print out cyanos to do phytoref
+#cyanos <- taxa[grep("Cyanobacteria", taxa$Phylum),] %>% filter(is.na(Genus))
+#write_tsv(cyanos, "unknowngenuscyanos.tsv")
+#all identified as non-cyanos, therefore removing misidentified cyanobacterial ASV's (actually chloroplasts) from the count data as well as from taxa
+#sed_16S_counts <- anti_join(sed_16S_counts, cyanos, by="ASV_ID")
+#taxa <- anti_join(taxa, cyanos, by="ASV_ID")
+
+#reading in metadata that contains chemistry and other measurements, ironII and ironIII measurements are not to be trusted and therefore removed, the same goes for redox, while oxygen percentage is redundant
+meta <- read_csv("../data/16S_ampliseq/SEDIMENT_MASTER_DATA.csv", 
+                 col_types=cols(.default=col_double(), 
+                                sample=col_character(), 
+                                name=col_character(), 
+                                sampleRNA=col_character(), 
+                                season=col_character(), 
+                                month=col_character(), 
+                                date=col_date(format="%d/%m/%Y"),
+                                sampletag=col_character(), 
+                                site=col_character(), 
+                                group=col_character(), 
+                                oxygenstate=col_character(), 
+                                type=col_character())) %>% 
+  select(-c("IIiron", "IIIiron", "oxygenperc", "redox"))
+
+meta$name <- sub("^", "sed_", meta$name)
+
+###the temperature of I in August was measured to 25.0°C but this is not possible, rather a likely measuring instrument error, since the surface water was 18-19°C and not even the shallow site had that warm water
+meta <- meta %>% 
+  mutate(temperature = na_if(temperature, 25.0))
+
+sed_16S_counts <- left_join(sed_16S_counts, meta, by="sample")
+
+ALL <- left_join(sed_16S_counts, taxa, by="ASV_ID") %>% 
+  group_by(name) %>% 
+  mutate(relab=count/sum(count)) %>% 
+  ungroup()
+
+ALL$month <- factor(ALL$month, levels=c("march","may","june","july","august","october","november","december"))
+
+meta$month <- factor(meta$month, levels=c("march","may","june","july","august","october","november","december"))
+```
+
+```{r asv counts}
+#bonus stats
+#no of unique asvs
+length(unique(sed_16S_counts$ASV_ID))
+#check annotation at different levels
+na_count <-sapply(taxa, function(y) sum(is.na(y)))
+na_count <- as.data.frame(na_count)
+na_count$all_count <- c(29508,29508,29508,29508,29508,29508,29508,29508,29508,29508,29508) #number of counts
+na_count$percent_na <- na_count$na_count/na_count$all_count*100
+na_count$percent_anno <- 100-na_count$percent_na
+na_count
+dplyr::select(na_count, percent_na)
+```
+
+```{r color palette}
+#define colour objects
+colmonths <- c("#b2df8a","#33a02c","#fdbf6f","#ff7f00","#fb9a99","#e31a1c","#a6cee3")
+allmonths <- c("#b2df8a","#33a02c","#fdbf6f","#ffef88","#ff7f00","#fb9a99","#e31a1c","#a6cee3")
+coldates <- c("#b2df8a","#33a02c","#fdbf6f","#ff7f00","#fb9a99","#e31a1c","#a6cee3","#1f78b4")
+alldates <- c("#b2df8a","#33a02c","#fdbf6f","#ffef88","#ff7f00","#fb9a99","#e31a1c","#a6cee3","#1f78b4")
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+  "green4",
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "black", "gold1",
+  "skyblue2", "#FB9A99", # lt pink
+  "palegreen2",
+  "#CAB2D6", # lt purple
+  "#FDBF6F", # lt orange
+  "gray70", "khaki2",
+  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+  "darkturquoise", "green1", "yellow4", "yellow3",
+  "darkorange4", "brown"
+)
+
+c25b <- c(
+  "darkorange4",
+  "dodgerblue2", "darkturquoise", "#E31A1C", # red
+  "green4", "yellow3",
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "black", "gold1",
+  "skyblue2", "#FB9A99", # lt pink
+  "palegreen2",
+  "#CAB2D6", # lt purple
+  "#FDBF6F", # lt orange
+  "gray70", "khaki2",
+  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+  "green1", "yellow4", "brown"
+)
+
+#check which phyla
+cols.phylum <- c(
+  "Acidobacteriota"="#FB9A99",
+  "Actinobacteriota"="#E31A1C",
+  "Asgardarchaeota"="palegreen2",
+  "Bacteroidota"="#6A3D9A",
+  "Bdellovibrionota_C"="darkorange4",
+  "Calditrichota"="#009E73",
+  "Campylobacterota"="#FF7F00",
+  "Chloroflexota"="gold1",
+  "Cyanobacteria"="green4",
+  "Delongbacteria"="yellow4",
+  "Desulfobacterota"="skyblue",
+  "Desulfobacterota_B"="steelblue4",
+  "Desulfobacterota_E"="dodgerblue2",
+  "Desulfobacterota_F"="blue1",
+  "Firmicutes"="#CC79A7",
+  "Firmicutes_A"="orchid1",
+  "Gemmatimonadota"="#D55E00",
+  "Krumholzibacteriota"="#0072B2",
+  "Myxococcota"="#F0E442",
+  "Nitrospirota"="darkviolet",
+  "Omnitrophota"="#E69F00",
+  "Patescibacteria"="#CAB2D6",
+  "Planctomycetota"="#FDBF6F",
+  "Proteobacteria"="#3d3e40",
+  "Spirochaetota"="#56B4E9",
+  "Verrucomicrobiota"="khaki2",
+  "Zixibacteria"="maroon"
+)
+
+cols.phylum2 <- c(
+  "#E31A1C",
+  "#6A3D9A",
+  "darkorange4",
+  "#FF7F00",
+  "gold1",
+  "green4",
+  "skyblue",
+  "blue1",
+  "#CAB2D6",
+  "darkviolet",
+  "palegreen2",
+  "orchid1",
+  "#D55E00",
+  "#0072B2",
+  "#F0E442",
+  "dodgerblue2",
+  "#FDBF6F",
+  "#CC79A7",
+  "#009E73",
+  "#56B4E9",
+  "khaki2",
+  "maroon"
+)
+
+cols.genus <- c("#5e0024",
+"#85ff95",
+"#0027c5",
+"#a8cc00",
+"#9600c3",
+"#52a200",
+"#d600ce",
+"#017f13",
+"#e65fff",
+"#b9ab00",
+"#0258eb",
+"#ffc92b",
+"#000c84",
+"#ffdf6e",
+"#aa6cff",
+"#8b8100",
+"#6e8aff",
+"#b97b00",
+"#ff7ff5",
+"#11ffd4",
+"#b50000",
+"#00cacb",
+"#ff4255",
+"#019c85",
+"#ff6dc3",
+"#1a3800",
+"#ffa1e6",
+"#595800",
+"#aea2ff",
+"#9c2e00",
+"#6bccff",
+"#a40041",
+"#abf5ff",
+"#240035",
+"#fffce7",
+"#6e005f",
+"#ff946a",
+"#00346d",
+"#ff6b90",
+"#003b31",
+"#ffb5b7",
+"#001611",
+"#0064a4",
+"#3a1500",
+"#005468",
+"#240008")
+
+pub_cols <- c(
+  "#1b9e77",  # teal-grün
+  "#d95f02",  # orange
+  "#7570b3",  # violett
+  "#e7298a"   # pink/magenta
+)
+
+family_cols <- c(
+  "skyblue2", 
+  "#FB9A99", 
+  "palegreen2",
+  "#FDBF6F",
+  "#6A3D9A",
+  "darkorange4",
+  "#FF7F00",
+  "#0064a4",
+  "gold1",
+  "green4",
+  "blue1",
+   "#1b9e77",
+  "#d95f02",  
+  "#fffce7",
+   "#CAB2D6")
+
+#many different colours
+qual_col_pals = brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector = unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+col_vector2 <- rep(col_vector, 2)
+col_vector3 <- c(col_vector, c25)
+
+#pie(rep(1,n), col=col_vector3)
+
+#for making legend smaller
+addSmallLegend <- function(myPlot, pointSize = 0.5, textSize = 3, spaceLegend = 0.1) {
+    myPlot +
+        guides(shape = guide_legend(override.aes = list(size = pointSize)),
+               color = guide_legend(override.aes = list(size = pointSize))) +
+        theme(legend.title = element_text(size = textSize), 
+              legend.text  = element_text(size = textSize),
+              legend.key.size = unit(spaceLegend, "lines"))
+}
+```
+
+#Chemistry
+
+```{r oxygen history plot - Supplemental S1}
+
+ox_his <-read_ods("../data/oxygen_hist/oxygen_hist.ods")
+
+
+ox_his$site <- factor(ox_his$site, levels = c("Shallow", "Intermediate", "Deep"))
+ox_his$publication <- gsub(";", ";\n", ox_his$publication)
+
+ggplot(ox_his, aes(x = year, y = oxygen, colour = publication)) +
+  geom_point(size = 5, alpha = 0.7) +
+  facet_wrap(~ site) +
+  theme_bw()+
+  labs(
+    x = "Year",
+    y = expression("Oxygen concentration (mg/L"),
+    colour = "Publication"
+  ) +
+  scale_colour_manual(values = pub_cols)+
+  theme(
+    text = element_text(size = 12),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  )+
+   guides(colour = guide_legend(nrow = 2))
+
+#ggsave("../figure/Figure_pdf/supplement/supplemental_S1.pdf")
+```
+
+```{r PCA - Chemistry - Figure 2}
+
+#redo metatable for fitting to run a PCA (get rid of NAs)
+meta_subpca <- meta %>%
+  dplyr::select(site, date, temperature, oxygen, pH, totaliron, phosphate, sulfate, nitrate, organicmatter, sample) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var="sample") %>% 
+  na.omit() #64 out of 81
+
+#Change col names
+colnames(meta_subpca) <- c(
+  "Site",
+  "Date",
+  "Temp. (°C)",
+  "O₂ (mg/L)",
+  "pH",
+  "Total Fe (µM)",
+  "PO₄³⁻ (µM)",
+  "SO₄²⁻ (mM)",
+  "NO₃⁻ (µM)",
+  "Organic matter (%)"
+)
+
+meta_subpca$Date <- as.factor(meta_subpca$Date)
+
+#run PCA
+pcaSED_res <- prcomp(meta_subpca[,-c(1:2)], scale. = TRUE)
+
+#Plot PCA
+autoplot(pcaSED_res,
+         data = meta_subpca,
+         colour = "Date",
+         shape = "Site",
+         size = 2,
+         loadings = TRUE,
+         loadings.colour = "grey50",
+         loadings.size=1,
+         loadings.label.colour="black",
+         loadings.label = TRUE,
+         loadings.label.size = 2) +
+  theme_bw() +
+  coord_fixed(clip = "off") +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    plot.margin = margin(10, 10, 20, 10),
+      legend.text = element_text(size = 5),
+    legend.title = element_text(size = 6)
+  ) +
+  guides(colour = guide_legend(nrow = 4),
+         shape = guide_legend(nrow = 3))+
+  scale_colour_manual(values = coldates)+
+   labs(
+    colour="Date",
+    shape="Site"
+  )
+
+#ggsave("../figure/Figure_pdf/fig2_PCAchem.pdf", width=95, heigh=100, units="mm", dpi=300, limitsize=FALSE)
+```
+
+```{r Supplemental Figure S2}
+#Set the right labels
+y_labels <- c(
+  organicmatter = "Organic matter (%)",
+  oxygen = "Oxygen (mg/L)",
+  nitrate = "Nitrate (µM)",
+  phosphate = "Phosphate (µM)",
+  sulfate = "Sulfate (mM)",
+  totaliron = "Total iron (µM)",
+  pH = "pH",
+  temperature = "Temperature (°C)"
+)
+
+#run all parameter in a loop
+meta$date <- as.Date(meta$date)
+meta$month <- format(as.Date(meta$date), "%b")
+meta$month <- factor(meta$month,
+                     levels = unique(meta$month[order(as.Date(meta$date))]))
+month_levels <- unique(meta$month[order(as.Date(meta$date))])
+
+meta$month <- factor(meta$month, levels = month_levels)
+
+for (i in names(y_labels)) {
+
+  var <- sym(i)
+
+  month_levels <- unique(meta$month[order(as.Date(meta$date))])
+  meta$month <- factor(meta$month, levels = month_levels)
+
+  plt <- meta %>%
+    ggplot(aes(x = month, y = !!var)) +
+    geom_point() +
+    facet_wrap(~site, ncol = 3) +
+    scale_x_discrete(drop = TRUE) +
+    labs(y = y_labels[i], x = "Month") +
+    theme_bw() +
+    theme(
+      text = element_text(size = 8),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank()
+    )
+
+  plots[[i]] <- plt
+}
+
+
+
+#Arrange the parameters you want to display together
+ggarrange(
+  plots$organicmatter +rremove("xlab"),
+  plots$oxygen +rremove("xlab"),
+  plots$nitrate+rremove("xlab"),
+  plots$totaliron+rremove("xlab"),
+  plots$phosphate+rremove("xlab"),
+  plots$sulfate+rremove("xlab"),
+  plots$pH+rremove("xlab"),
+  plots$temperature+rremove("xlab"),
+  ncol = 2,
+  nrow = 4,
+  labels = LETTERS[1:8],
+  font.label=list(size=6),
+  common.legend=TRUE
+)
+
+
+#ggsave("../figure/Figure_pdf/supplement/supplemental_s2.pdf", width=180, height=180, units="mm")
+
+```
+
+```{r Statistics - Chemistry}
+
+#For data with 3 replicate per sample date
+#Differences in biogeochemical parameters among sampling sites and sampling months were assessed using two-way analysis of variance
+
+#make your data to factors
+meta$site <- factor(meta$site,
+                   levels=c("Shallow",
+                            "Intermediate",
+                            "Deep"))
+
+meta$date <- factor(meta$date,
+                   levels=levels(meta$date))
+
+#function
+analyse_parameter <- function(data, response){
+
+  form <- as.formula(paste(response, "~ site * date"))
+  model <- lm(form, data = data)
+
+  # ANOVA table
+  anova_tab <- as.data.frame(car::Anova(model, type = 3))
+  anova_tab$term <- rownames(anova_tab)
+  rownames(anova_tab) <- NULL
+
+  # Posthoc: date within site
+  emm_date <- emmeans(model, ~ date | site)
+  posthoc_date <- as.data.frame(pairs(emm_date, adjust = "tukey"))
+  posthoc_date$contrast_type <- "date_within_site"
+  posthoc_date$response <- response
+
+  # Posthoc: site within date
+  emm_site <- emmeans(model, ~ site | date)
+  posthoc_site <- as.data.frame(pairs(emm_site, adjust = "tukey"))
+  posthoc_site$contrast_type <- "site_within_date"
+  posthoc_site$response <- response
+
+  return(list(
+    anova = anova_tab,
+    posthoc_date = posthoc_date,
+    posthoc_site = posthoc_site
+  ))
+}
+
+
+
+#extract combined results and safe
+params <- c("sulfate", "nitrate", "phosphate", "totaliron", "organicmatter")
+
+results <- lapply(params, function(x){
+  analyse_parameter(meta, x)
+})
+
+
+
+#save
+
+#for(i in seq_along(params)){
+  
+ # res <- results[[i]]
+ # name <- params[i]
+  
+  
+ # write.csv(res$anova, paste0(name, "_anova.csv"), row.names=FALSE)
+ # write.csv(res$posthoc_date, paste0(name, "_posthoc_date.csv"), row.names=FALSE)
+ # write.csv(res$posthoc_site, paste0(name, "_posthoc_site.csv"), row.names=FALSE)
+#}
+
+
+
+
+#graphical overview
+model <- analyse_parameter(meta,"sulfate")
+
+par(mfrow=c(2,2))
+plot(model)
+#if QQPlot and Resiidual vs fitted looks good - good
+#if shapiro and levene is non signifikant - good
+#if shapiro is signifikant, try to use log10(x+1) or sqrt(x) and run again
+
+
+```
+
+```{r Chemistry Radar-Plot - Figure 1 }
+
+meta2 <- meta #make a subset where you remove the october deep site outlier from the dataset (error in the machine during measurement)
+
+which(meta2$site == "deep" & meta2$month == "october") #select the rows
+meta2[which(meta2$site == "deep" & meta2$month == "october"), "temperature"] <- NA #replace the temperature with NA
+
+meta_radar <- meta2 %>%
+  dplyr::select(site, date, temperature, oxygen, nitrate, phosphate, sulfate, organicmatter, totaliron, pH) %>%
+  rename(
+   `Temp.\n(°C)` = temperature,
+    `O2\n(mg/L)` = oxygen,
+    `NO3\n(µM)` = nitrate,
+    `PO4\n(µM)` = phosphate,
+    `SO4\n(mM)` = sulfate,
+    `OM\n(%)` = organicmatter,
+    `Tot. Fe\n(µM)` = totaliron,
+    `pH` = pH
+  )
+
+  meta_radar%>%
+  ggRadar(aes(group=site, color=site, facet=date),  use.label=TRUE, space="free",
+          rescale = TRUE, legend.position = "left",
+          size = 1) +
+  scale_fill_manual(name="Site", values=c("blue","orange","darkgreen")) +
+  scale_color_manual(name="Site", values=c("blue","orange","darkgreen")) +
+ # scale_y_log10(breaks = NULL) + # don't show ticks
+  scale_y_continuous(trans = scales::pseudo_log_trans(sigma = 0.01),
+                     breaks = c(-1, -0.1, 0, 0.1, 1, 10), minor_breaks = NULL)+
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 6),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.title.y = element_blank()
+)
+  
+
+#ggsave("../figure/Figure_pdf/fig1_sed_radarplot.pdf", width=180, units="mm", dpi=300)
+
+```
+
+#16S rRNA gene amplicon data analysis
+
+```{r db-RDA - Figure 4}
+
+#Meta table
+metasubSED <- meta %>% 
+  dplyr::select(site, month, date, temperature, oxygen, pH, totaliron, phosphate, sulfate, nitrate, organicmatter, depth, sample) %>% 
+  na.omit()
+
+#standardising the environmental variables
+for (i in unique(colnames(metasubSED[,4:12]))){
+  metasubSED[i] <- decostand(metasubSED[i], method="standardize")
+}
+
+setdiff(meta$sample,metasubSED$sample)
+#samples with missing metadata, therefore excluded:
+# "X1001" "X1028" "X1029" "X1030" "X1031" "X1032" "X1033" "X1034" "X1035" "X1036" "X1049" "X1050" "X1051" "X1061" "X1063"
+
+#subset counts-data
+SEDsub <- ALL %>% 
+  filter(!sample %in% c("X1001","X1028","X1029","X1030","X1031","X1032","X1033","X1034","X1035","X1036","X1049","X1050","X1051","X1061","X1063", "X1064", "X1065"))
+
+#Wide format
+SEDsubwide <- SEDsub %>% 
+  dplyr::select(ASV_ID,sample,relab) %>% #select ASV, sample and relab
+  spread(ASV_ID, relab, fill= 0) %>% #wide format with sequence and relab, filling gaps with 0
+  remove_rownames() %>% #remove of row names
+  column_to_rownames(var = "sample")
+
+#checking relationship between variable and species abundance, should be linear and not unimodal (https://www.davidzeleny.net/anadat-r/doku.php/en:ordination) 
+#,19,20,22:28
+for (i in unique(colnames(SEDsub[,c(9,17:24)]))){
+  var <- sym(i)
+  plt <- SEDsub %>% ggplot(aes(x=!!var, y=relab)) +
+    geom_point()
+  print(plt)
+}
+
+#capscale creates a constrained principal coorinates analysis (PCoA) with chem/variables and bray-curtis distances =db-RDA (but PCoA actually on distance matrix)
+#depth excluded due to vif-test below
+dbRDA_SED=dbrda(SEDsubwide ~ temperature + oxygen + pH + totaliron + phosphate + sulfate + nitrate + organicmatter, data=metasubSED, dist="bray")
+
+#read: https://uw.pressbooks.pub/appliedmultivariatestatistics/chapter/rda-and-dbrda/
+
+# Variance inflation factor - check for multiconneality
+vif.cca(dbRDA_SED) #values above 5 are excluded - here depth excluded
+
+#check if model is significant
+anova(dbRDA_SED)
+#it is (0.001), check how much R2 is explained by all variable
+adjR2.dbrda <- RsquareAdj(dbRDA_SED)$adj.r.squared
+#29.5% - not adjusted is 38.4%
+
+plot(dbRDA_SED)
+summary(dbRDA_SED)
+screeplot(dbRDA_SED)
+#Each RDA axis has an eigenvalue, which is the proportion of the variance explained by each axis. from: https://fukamilab.github.io/BIO202/06-B-constrained-ordination.html
+
+#testing with ordiR2step
+set.seed(42)
+#"null" model, only including species
+dbRDA_SED0=dbrda(SEDsubwide ~ 1, data=metasubSED[,4:11], dist="bray")
+sel.osR2 <- ordiR2step(dbRDA_SED0, scope=formula(dbRDA_SED), R2scope=adjR2.dbrda, direction="forward", permutations=9999, step=9999, trace=FALSE)
+sel.osR2
+#total inertia 14.57, dbRDA1 eigenvalue 3.34 and dbRDA2 0.851 might translate into 35.05%?
+(3.34+0.851)/14.57*100
+sel.osR2$anova #nitrate excluded
+
+sel.osR2_adj <- sel.osR2
+sel.osR2_adj$anova
+sel.osR2_adj$anova$`Pr(>F)` <- p.adjust (sel.osR2$anova$`Pr(>F)`, method = 'holm', n=8)
+sel.osR2_adj$anova
+#with this, oxygen, organicmatter, temperature, phosphate, totaliron are significant (below/at 0.05, 0.0008-0.0354)
+#therefore rerunning dbRDA with these parameters
+dbRDA_SED2=dbrda(SEDsubwide ~ 
+                   oxygen + 
+                   organicmatter + 
+                   temperature  + 
+                   totaliron  +
+                   phosphate + 
+                   sulfate+ 
+                   pH, 
+                 data=metasubSED, dist="bray")
+
+anova(dbRDA_SED2)
+#model still significant (0.001)
+RsquareAdj(dbRDA_SED2) #explaining 28.8% not adjusted 36.7%
+
+#just checking
+sel.osR3 <- ordiR2step(dbRDA_SED0, scope=formula(dbRDA_SED2), R2scope=0.3259583, direction="forward", permutations=9999, step=9999, trace=FALSE)
+sel.osR3
+sel.osR3$anova #would exclude pH... and probably phosphate after adj, maybe also sulfate (rerun, sulfate and phosphate are border, while pH still sig)
+
+summary(dbRDA_SED2) #looking at proportion explained for dbRDA1 it gives 0.235 while for 2 it gives 0.0602 which gives 23.5% and 6.02%
+
+plot(dbRDA_SED2)
+screeplot(dbRDA_SED2)
+
+anova(dbRDA_SED2, by="axis", perm.max=999) #test axes for significance: dbRDA1 & 2 0.001 (adj 0.007) dbRDA3 0.041 (adj 0.287)
+stats::anova(dbRDA_SED2, by="terms", perm.max=999) #test for sign. environ. variables, not the same as forward selection, after adj only oxy, OM, temp and totiron (but depends on adj method)
+p.adjust(c(0.001, 0.001, 0.001, 0.001, 0.058, 0.077, 0.019), method="holm") #only first 4 sig - oxygen, organicmatter, temperature, totaliron, not phosphate, sulfate, pH (first 4 0.007, following 3 0.078)
+#scores(dbRDA_SED3) - not that fun...
+
+#####GGPLOT VERSION#######
+#Extract site data and join with sample information
+df_sites <- as.data.frame(scores(dbRDA_SED2, display = "sites"))
+df_sites <- df_sites %>%
+  rownames_to_column("sample") %>%
+  inner_join(metasubSED, by = "sample")
+
+#from https://uw.pressbooks.pub/appliedmultivariatestatistics/chapter/rda-and-dbrda/ :
+# Site scores – result of multiplying loadings by the original variables. Stored as Oak1_dbrda_summary$sites.
+# Site constraints – result of multiplying loadings by the fitted values (constrained axes) and residuals (unconstrained axes). Stored as Oak1_dbrda_summary$constraints.  These are the data that are plotted when we graph a dbRDA.
+
+#environmental vector
+df_env <- as.data.frame(scores(dbRDA_SED2, display = "bp"))
+df_env$variable <- rownames(df_env)
+
+
+#significance of terms
+term_test <- as.data.frame(anova(dbRDA_SED2, by = "terms"))
+term_test$variable <- rownames(term_test)
+term_test$p.adj <- p.adjust(term_test$`Pr(>F)`, method = "holm")
+term_test$sig <- ifelse(term_test$p.adj < 0.05, "*", "")
+#merge
+df_env <- left_join(df_env,
+                    term_test[, c("variable", "sig")],
+                    by = "variable")
+
+df_env$sig[is.na(df_env$sig)] <- ""
+
+
+#rename variables 
+
+
+labels <- c(
+  temperature   = "Temp. (°C)",
+  oxygen        = "O2 (mg/L)",
+  pH            = "pH",
+  totaliron     = "Total Fe (µM)",
+  phosphate     = "PO₄³⁻ (µM)",
+  sulfate       = "SO₄²⁻ (mM)",
+  nitrate       = "NO₃⁻ (µM)",
+  organicmatter = "Organic matter (%)"
+)
+
+idx <- match(df_env$variable, names(labels))
+df_env$variable[!is.na(idx)] <- labels[idx[!is.na(idx)]]
+
+#draw plot
+ggplot() +
+
+  # SITES (points)
+  geom_point(
+    data = df_sites,
+    aes(dbRDA1, dbRDA2,
+        colour = as.factor(date),
+        shape = site),
+    size = 3
+  ) +
+
+  scale_colour_manual(values = coldates) +
+
+  # ENV ARROWS
+  geom_segment(
+    data = df_env,
+    aes(x = 0, y = 0,
+        xend = dbRDA1,
+        yend = dbRDA2),
+    colour = "grey50",
+    arrow = arrow(length = unit(0.2, "cm"))
+  ) +
+
+  # ENV LABELS + significance
+  geom_text_repel(
+    data = df_env,
+    aes(
+      x = dbRDA1,
+      y = dbRDA2,
+      label = paste0(variable, sig)
+    ),
+    size = 2,
+    colour = "black"
+  ) +
+
+  # axes scaling (keine Quetschung)
+  scale_x_continuous(expand = expansion(mult = 0.15)) +
+  scale_y_continuous(expand = expansion(mult = 0.10)) +
+
+  # axis labels (wie in deinem Original)
+  labs(
+    colour="Date",
+    shape="Site",
+    x = "dbRDA1 (23.5%)",
+    y = "dbRDA2 (6.05%)"
+  ) +
+
+  # layout fix (statt coord_fixed → weniger gequetscht)
+  coord_cartesian(clip = "off") +
+
+  # theme
+  theme_bw() +
+
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+
+    legend.title = element_text(size = 6),
+    legend.text = element_text(size = 5),
+
+    plot.margin = margin(10, 10, 20, 10)
+  ) +
+
+  # legend layout (wie bei dir)
+  guides(
+    colour = guide_legend(nrow = 4),
+    shape  = guide_legend(nrow = 3)
+  ) 
+
+
+#ggsave("../figure/Figure_pdf/fig4_dbRDA.pdf",width = 95, height = 100, units = "mm", device = cairo_pdf)
+
+
+#understanding
+#from https://uw.pressbooks.pub/appliedmultivariatestatistics/chapter/rda-and-dbrda/ :
+#The vectors show the direction in which each explanatory variable is most strongly associated with the axes.
+#Finally, note that the set of explanatory variables is considered en masse; the loadings demonstrate how the score on each constrained axis is a linear combination of those explanatory variables.  These techniques are therefore not designed to evaluate which explanatory variables would be important if considered independently.
+# 
+
+```
+
+#Species and community overview
+
+```{r summary annotation counts}
+#check annotation at different levels
+na_count <-sapply(taxa, function(y) sum(is.na(y)))
+na_count$all_count <- c(29508,29508,29508,29508,29508,29508,29508,29508,29508,29508,29508)
+na_count$percent_na <- na_count$na_count/na_count$all_count*100
+na_count$percent_anno <- 100-na_count$percent_na
+na_count
+dplyr::select(na_count, percent_na) #phylum 5.94% NAs, Family 17.67% - these are reasonable
+
+
+
+```
+
+```{r summary ASV relab - various taxa levels}
+
+sum_fam <-ALL %>% 
+    group_by(site, date) %>% 
+    mutate(relab=count/sum(count)) %>% 
+    ungroup() %>% 
+    group_by(site,date, Family) %>% 
+    summarise(taxlevel_relab=sum(relab), sd=sd(relab)) %>% 
+    ungroup() %>% 
+    group_by(site, Family) %>% 
+    summarise(taxlevel_relab=mean(taxlevel_relab), sd=sd(taxlevel_relab)) %>% 
+    ungroup()
+
+#Most abundant taxa
+
+#relative abundance per sample
+# Relative abundance per sample
+phy_summary <- ALL %>%
+  group_by(sample) %>%
+  mutate(relab = count / sum(count)) %>%
+  ungroup() %>%
+  group_by(sample, Phylum) %>%
+  summarise(relab = sum(relab), .groups = "drop") %>%
+  group_by(Phylum) %>%
+  summarise(
+    mean = mean(relab),
+    sd   = sd(relab),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean))
+
+# Top 15
+phy_summary %>%
+  slice_head(n = 15)
+
+phy_summary %>%
+  slice_head(n = 15) %>%
+  mutate(
+    `Relative abundance` = sprintf("%.1f ± %.1f",
+                                   mean*100,
+                                   sd*100)
+  ) %>%
+  select(Phylum, `Relative abundance`)
+
+#Family level
+
+fam_summary <- ALL %>%
+  group_by(sample) %>%
+  mutate(relab = count / sum(count)) %>%
+  ungroup() %>%
+  group_by(sample, Family) %>%
+  summarise(relab = sum(relab), .groups = "drop") %>%
+  group_by(Family) %>%
+  summarise(
+    mean = mean(relab),
+    sd   = sd(relab),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean))
+
+# Top 20
+fam_summary %>%
+  slice_head(n = 20)
+
+fam_summary %>%
+  slice_head(n = 20) %>%
+  mutate(
+    `Relative abundance` = sprintf("%.1f ± %.1f",
+                                   mean*100,
+                                   sd*100)
+  ) %>%
+  select(Family, `Relative abundance`)
+
+#Most abundant per site on family level
+fam_site_summary <- ALL %>%
+  group_by(sample) %>%
+  mutate(relab = count / sum(count)) %>%
+  ungroup() %>%
+  group_by(sample, site, Family) %>%
+  summarise(relab = sum(relab), .groups = "drop") %>%
+  complete(sample, site, Family, fill = list(relab = 0)) %>%
+  group_by(site, Family) %>%
+  summarise(
+    mean = mean(relab),
+    sd   = sd(relab),
+    .groups = "drop"
+  ) %>%
+  arrange(site, desc(mean))
+
+fam_site_top15 <- fam_site_summary %>%
+  group_by(site) %>%
+  slice_max(mean, n = 15, with_ties = FALSE) %>%
+  ungroup()
+
+fam_site_top15 <- fam_site_top15 %>%
+  mutate(
+    mean = round(mean * 100, 1),
+    sd   = round(sd * 100, 1),
+    abundance = paste0(mean, " ± ", sd, "%")
+  )
+
+fam_site_top15
+```
+
+```{r rarefaction, sed - Supplemental Figure S3}
+col <- c("darkgreen","orange","blue")
+grp <- factor(meta$site, levels=c("Shallow","Intermediate","Deep"))
+cols <- col[grp]
+table(cols, useNA = "always")
+cols <- adjustcolor(cols, alpha.f = 0.3)
+
+#all year
+sed_countsRAW <- ALL[,1:4] %>% 
+  pivot_wider(names_from=ASV_ID, values_from=count, values_fill= 0) %>% 
+  dplyr::select(-"sample") %>%   
+#wide format with sequence and count, filling gaps with 0
+  remove_rownames() %>% 
+#remove row names
+  column_to_rownames(var = "name")
+#most of them seem to level out
+sed_raremax <- min(rowSums(sed_countsRAW)) #smallest 5333
+
+#dim(sed_countsRAW)
+#summary(rowSums(sed_countsRAW))
+#summary(specnumber(sed_countsRAW))
+
+#unique(meta$site)
+
+
+#rarefaction curve - run everything together
+#pdf("../figure/Figure_pdf/sed_rarecurve_81samp_FS3.pdf",
+ #   width = 8, height = 3)
+
+#par(mfrow = c(1,3))
+
+#xmax <- 100000
+#ymax <- 6500
+
+#for(s in c("Shallow","Intermediate","Deep")){
+
+ # idx <- meta$site == s
+
+ # rarecurve(
+  #  sed_countsRAW[idx, ],
+  #  step = 20,
+  #  sample = min(rowSums(sed_countsRAW[idx, ])),
+  #  col = c("darkgreen","orange","blue")[which(c("Shallow","Intermediate","Deep")==s)],
+   # label = FALSE,
+   # main = s,
+   # xlab = "",
+   # ylab = "",
+   # xlim = c(0, xmax),
+   # ylim = c(0, ymax),
+   # xaxt = "n",
+  #  yaxt = "n"
+ # )
+
+ # axis(1, at = c(0, 25000, 50000, 75000, 100000))
+#  axis(2, at = c(0, 2000, 4000, 6000))
+
+#  mtext("Individuals", side = 1, line = 2.5)
+ # mtext("Species richness", side = 2, line = 2.5)
+#}
+
+#dev.off()
+
+```
+
+```{r barplot - Figure 5 and Supplemental Figure S4 }
+#plotting relative abundance
+
+#phylum
+phy_df <- ALL %>% 
+  group_by(site, date) %>% 
+  mutate(relab = count / sum(count)) %>% 
+  ungroup() %>% 
+  group_by(site, date, Phylum) %>% 
+  summarise(taxlevel_relab = sum(relab), .groups = "drop")
+
+#Select top 15 families from the mean relative abundance across samples
+top15_phy <- phy_df %>%
+  group_by(Phylum) %>%
+  summarise(mean_relab = mean(taxlevel_relab, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean_relab)) %>%
+  slice(1:15) %>%
+  pull(Phylum)
+
+#summarize all the others into "other"
+phy_plot <- phy_df %>%
+  mutate(Phylum2 = ifelse(Phylum %in% top15_phy, Phylum, "Other")) %>%
+  group_by(site, date, Phylum2) %>%
+  summarise(taxlevel_relab = sum(taxlevel_relab), .groups = "drop")
+
+#make sure "other" is at the end
+phy_order <- phy_plot %>%
+  group_by(Phylum2) %>%
+  summarise(mean_relab = mean(taxlevel_relab), .groups = "drop") %>%
+  arrange(desc(mean_relab)) %>%
+  pull(Phylum2)
+
+phy_order <- c(setdiff(phy_order, "Other"), "Other")
+
+phy_plot$Phylum2 <- factor(phy_plot$Phylum2, levels = phy_order)
+phy_plot$site <- factor(phy_plot$site, levels = c("Shallow", "Intermediate", "Deep"))
+
+#plot on family level
+ggplot(phy_plot, aes(x = date, y = taxlevel_relab, fill = Phylum2)) +
+  geom_col() +
+  labs(y = "Relative abundance", x = "") +
+   scale_fill_manual(values=cols.phylum2, na.value = "grey76")+
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.justification = "top",
+    legend.margin = margin(0,0,0,0),
+    legend.box.margin = margin(-15,28,0,-10),
+    axis.text.x = element_text(angle = 90),
+    axis.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    legend.title = element_blank()
+  ) +
+  facet_wrap(~site)
+
+
+#genus
+genus <- ALL %>% 
+    group_by(site, date) %>% 
+    mutate(relab=count/sum(count)) %>% 
+    ungroup() %>% 
+    group_by(site, date, Genus) %>% 
+    summarise(taxlevel_relab=sum(relab)) %>% 
+    ungroup() %>% 
+    filter(taxlevel_relab>0.01) %>% #1%
+    ggplot(aes(x=date, y=taxlevel_relab, fill=Genus)) +
+    geom_col() +
+    scale_fill_manual(values=cols.genus, na.value = "#303030") +
+   # scale_x_date(date_labels="%Y-%m-%d", breaks = unique(ALL$date)) +
+    labs(y="relab", x="") +
+    theme_bw() +
+   theme(
+      legend.position = "bottom",
+      legend.justification = "top",
+      legend.margin=margin(0,0,0,0),
+      legend.box.margin=margin(-15,28,0,-10),
+      axis.text.x = element_text(angle=90),
+      axis.title=element_text(size=9),
+      legend.text = element_text(size=8),
+      legend.title = element_text(size=9, angle=90, hjust=0.5)
+    ) +
+    facet_wrap(~site)
+
+ggarrange(phylum, genus, nrow=2, align="v", labels="AUTO")
+
+#ggsave("../figure/Figure_pdf/supplement/relab_barplot_supplemental_S4.pdf", width = 7,
+      # height = 10,
+      # device = cairo_pdf)
+
+#family
+#Top 20 families within the samples
+#Calculate the relative abundance
+fam_df <- ALL %>% 
+  group_by(site, date) %>% 
+  mutate(relab = count / sum(count)) %>% 
+  ungroup() %>% 
+  group_by(site, date, Family) %>% 
+  summarise(taxlevel_relab = sum(relab), .groups = "drop")
+
+#Select top 15 families from the mean relative abundance across samples
+top20_fam <- fam_df %>%
+  group_by(Family) %>%
+  summarise(mean_relab = mean(taxlevel_relab, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean_relab)) %>%
+  slice(1:15) %>%
+  pull(Family)
+
+#summarize all the others into "other"
+fam_plot <- fam_df %>%
+  mutate(Family2 = ifelse(Family %in% top20_fam, Family, "Other")) %>%
+  group_by(site, date, Family2) %>%
+  summarise(taxlevel_relab = sum(taxlevel_relab), .groups = "drop")
+
+#make sure "other" is at the end
+fam_order <- fam_plot %>%
+  group_by(Family2) %>%
+  summarise(mean_relab = mean(taxlevel_relab), .groups = "drop") %>%
+  arrange(desc(mean_relab)) %>%
+  pull(Family2)
+
+fam_order <- c(setdiff(fam_order, "Other"), "Other")
+
+fam_plot$Family2 <- factor(fam_plot$Family2, levels = fam_order)
+fam_plot$site <- factor(fam_plot$site, levels = c("Shallow", "Intermediate", "Deep"))
+
+#plot on family level
+ggplot(fam_plot, aes(x = date, y = taxlevel_relab, fill = Family2)) +
+  geom_col() +
+  labs(y = "Relative abundance", x = "") +
+   scale_fill_manual(values=family_cols, na.value = "grey76")+
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    legend.justification = "top",
+    legend.margin = margin(0,0,0,0),
+    legend.box.margin = margin(-15,28,0,-10),
+    axis.text.x = element_text(angle = 90),
+    axis.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    legend.title = element_blank()
+  ) +
+  facet_wrap(~site)
+
+#ggsave("../figure/Figure_pdf/fig5_relab_family.pdf", width=180, height=180, units="mm", dpi=300)
+
+#ANCOMBC analysis done separately.
+
+```
+
+#Diversity annd community structure
+
+```{r alpha diversity - Figure 3A}
+#alpha diversity
+##raw counts from SED
+example_input_data_SED <- ALL %>%
+  dplyr::select(ASV_ID, name, count) %>%  #select ASV, sample and count
+  pivot_wider(names_from=name, values_from=count, values_fill= 0) %>% #wide format with sequence and count, filling gaps with 0
+  column_to_rownames(var = "ASV_ID")
+
+#(e.g. species counts of the library with the lowest sequencing depth):
+Cmin_SED <- min(colSums(example_input_data_SED)) #4798
+
+SRS_output_SED <- SRS(data = example_input_data_SED, Cmin = Cmin_SED, set_seed=TRUE, seed=1)
+
+SRSshannon_SED <- SRS_output_SED %>%
+  t() %>%
+  data.frame() %>% 
+  rownames_to_column(var="name") %>% 
+  plyr::ddply(~name, function(x) {vegan::diversity(x[-1], index="shannon")}) %>%
+  rename(shannon= V1) %>% #Shannon 
+  left_join(meta, by="name")
+
+SRSshannon_SED$date <- as.factor(SRSshannon_SED$date)
+
+#split by site per date
+SRSshannon_SED %>%
+  ggplot(aes(x = site, y = shannon, fill=site)) + 
+  geom_boxplot() + 
+  scale_fill_manual(values=alldates) +
+  labs(x = "", y = "Shannon Index") +
+  theme_bw() +
+  theme(text = element_text(size = 10)) +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(size = 8, angle=90, hjust=1)) +
+  facet_wrap(~date, ncol=3) 
+
+#split per date per site
+SRSshannon_SED %>%
+  ggplot(aes(x = date, y = shannon, fill=date)) + 
+  geom_boxplot() + 
+  scale_fill_manual(values=alldates) +
+  labs(x = "", y = "Shannon Index") +
+  theme_bw() +
+  theme(text = element_text(size = 10)) +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(size = 8, angle=90, hjust=1)) +
+  facet_wrap(~site, ncol=3) 
+
+shanSRS_SED <- SRSshannon_SED %>%
+  ggplot(aes(x = date, y = shannon, fill=date)) + 
+  geom_boxplot() + 
+  scale_fill_manual(values=alldates) +
+  labs(x = "", y = "Shannon Index") +
+  theme_bw() +
+  theme(text = element_text(size = 10),
+        legend.position="none") +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(size = 8, angle=90, hjust=1)) +
+  facet_wrap(~site, ncol=3) 
+
+shanSRS_SED
+
+##Evenness calculations
+##SED
+
+B_SED <- SRS_output_SED %>%
+        t() %>%
+        data.frame() %>% 
+        rownames_to_column(var="name") %>%
+        remove_rownames() %>%
+        column_to_rownames(var="name")
+
+H_SED <- SRS_output_SED %>%
+      t() %>%
+      data.frame() %>% 
+      rownames_to_column(var="name") %>% 
+      plyr::ddply(~name, function(x) {vegan::diversity(x[-1], index="shannon")}) %>%
+      rename(shannon= V1)
+
+H_SED <- H_SED %>% 
+    remove_rownames() %>% 
+    column_to_rownames(var="name")
+
+J_SED <- H_SED/log(specnumber(B_SED))
+
+evenSH_SED <- J_SED %>% 
+  rownames_to_column(var="name")%>%
+  left_join(meta, by="name")
+
+evenSH_SED$date <- as.factor(evenSH_SED$date)
+
+ggshaneven_SED <- evenSH_SED %>%
+  ggplot(aes(x = date, y = shannon, fill=date)) + 
+  geom_boxplot() + 
+  scale_fill_manual(values=alldates) +
+  labs(x = "", y = "Shannon evenness") +
+  theme_bw() +
+  theme(text = element_text(size = 10)) +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(size = 8, angle=90, hjust=1)) +
+  facet_wrap(~site, ncol=3)
+
+ggshaneven_SED
+
+ggarrange(shanSRS_SED, ggshaneven_SED, ncol=2, common.legend = TRUE, legend="none")
+#ggsave("../figure/Figure_pdf/alphadiversity.pdf")
+
+#Diversity of the microbial communities was estimated by calculating the alpha diversity (Shannon’s H index) based on counts normalized using scaling with ranked subsampling. To test for significant differences in diver- sity between years and sites a linear regression model was used due to the nested nature of the data with three replicates per site and the interaction between the sites and years. Different models were fitted and the model that showed the best fit for the data structure was chosen based on Akaike information criterion (AIC). All fac- tors (years and sampling sites as interaction and replicates nested within sites) were used as fixed effects in the final model (‘lme()’ function, ‘stats’ package) due to the small sample size. The statistical differences between the factors were tested using the ‘anova’ function from the ‘stats’ package in R53 with pairwise comparison for years at each site using the ‘emmeans’ package.
+```
+
+```{r alpha diversity stats}
+#checking data post alpha diversity
+
+#Shannon
+#SED
+#Test for distribution
+shapiro.test(SRSshannon_SED$shannon) #significant different from normal distribution, for all data together, as well as split per site (e.g. [grep("O", SRSshannon_SED$name),])
+#Test for variance
+leveneTest(shannon ~ site, SRSshannon_SED) #No sign. diff. between variance depending on the group "site"
+#Test for variance for non-parametric data
+fligner.test(shannon ~ site, SRSshannon_SED) #variance in the groups are the same
+#Test for non parametric distribution
+wilcox.test(shannon ~ site, data=SRSshannon_SED[grep("O", SRSshannon_SED$name, invert=TRUE),]) #deep and int not diff
+wilcox.test(shannon ~ site, data=SRSshannon_SED[grep("A", SRSshannon_SED$name, invert=TRUE),]) #shal and int not diff
+wilcox.test(shannon ~ site, data=SRSshannon_SED[grep("I", SRSshannon_SED$name, invert=TRUE),]) #deep and shal are diff
+
+#mean
+SRSshannon_SED %>% group_by(site) %>% summarise(Mean=mean(shannon, na.rm=TRUE), sd=sd(shannon))
+
+#site          mean      sd
+#Deep        	6.294237	0.6444679		
+#Intermediate	6.502963	0.5027286		
+#Shallow	    6.660921	0.5533116
+
+###Histogram
+hist(SRSshannon_SED$shannon)
+###qqplot
+qqnorm(SRSshannon_SED$shannon, pch=1, frame=FALSE)
+qqline(SRSshannon_SED$shannon, col="steelblue", lwd=2)
+##qqplot with ggplot
+ggplot(SRSshannon_SED, aes(sample=shannon, colour=site))+
+  stat_qq()+
+  stat_qq_line()
+
+
+```
+
+```{r Alpha-div-stats-LMM comparing sites}
+#testing with linear model
+#splitting the data depending on site again to test time
+tmp <- SRSshannon_SED[grep('O', SRSshannon_SED$name),]
+#summary(lm(shannon ~ date, data=tmp))
+sum <- summary(lmer(shannon ~ date + (1|replicate), data=tmp))
+ p.adjust (sum$coefficients[, "Pr(>|t|)"], method = 'holm')
+#2017-10-02 is statistically different (0.0229) from the intercept (march) in the shallow (if p.adjust, not - 0.1832)
+tmp <- SRSshannon_SED[grep('I', SRSshannon_SED$name),]
+#summary(lm(shannon ~ date + date:replicate, data=tmp))
+summary(lmer(shannon ~ date + (1|replicate), data=tmp))
+#no date is statistically different from the intercept in the intermediate
+tmp <- SRSshannon_SED[grep('A', SRSshannon_SED$name),]
+#summary(lm(shannon ~ date + date:replicate, data=tmp))
+sum <-summary(lmer(shannon ~ date + (1|replicate), data=tmp))
+ p.adjust (sum$coefficients[, "Pr(>|t|)"], method = 'holm')
+#2017-12-14 is statistically different (0.0144) from the intercept (march) in the deep (if p.adjust, not - 0.1152)
+```
+
+```{r nMDS - Figure 3B}
+#similar to betadiversity-plots
+#According to Gavin Simpson at: https://stats.stackexchange.com/questions/458022/use-vegdist-function-before-metamds
+#Finally, note that computing the Bray-Curtis distances between your points is not the same as computing the beta diversity of your samples. For that to be true you'd have to be equating local and regional diversity as each sample being a region itself.
+###SED
+asvs_subsed <-  ALL %>%
+  dplyr::select(ASV_ID,name,relab) %>% 
+  pivot_wider(names_from=ASV_ID, values_from=relab, values_fill= 0) %>% 
+  remove_rownames() %>% 
+  column_to_rownames(var = "name")
+
+
+#NMDS with all sites together
+
+nmds_all <- metaMDS(
+  asvs_subsed,
+  distance = "bray",
+  k = 2,              # Only 2 dimension as we only use 2 
+  trymax = 250,
+  autotransform = FALSE,
+ trace = TRUE
+)
+#combine scores with your meta data
+nmds_all_df <- as.data.frame(nmds_all$points) %>%
+  rownames_to_column(var = "name") %>%
+  rename(NMDS1 = MDS1, NMDS2 = MDS2) %>%
+  left_join(meta, by = "name")
+
+nmds_all_df$site <- factor(nmds_all_df$site,
+                           levels = c("Shallow", "Intermediate", "Deep"))
+#plot
+stress_val <- round(nmds_all$stress, 3)
+
+nmds_sites <- ggplot(nmds_all_df,
+                     aes(x = NMDS1, y = NMDS2, colour = as.factor(date))) +
+  geom_point(size = 4) +
+  facet_wrap(~site, nrow = 1) +
+  scale_colour_manual(values = alldates, name = "date") +
+  labs(
+    x = "NMDS1",
+    y = "NMDS2"
+  ) +
+#  coord_equal() +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    text = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    legend.title = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 8)
+  ) +
+  annotate("text",
+           x = Inf, y = -Inf,
+           label = paste("Stress =", stress_val),
+           hjust = 1.1, vjust = -0.5,
+           size = 2.5)
+
+#nmds_sites
+
+
+ggarrange(shanSRS_SED, nmds_sites, nrow=2, ncol=1, labels=c("A", "B"))
+
+#ggsave("../figure/Figure_pdf/fig3_alpha_nmds.pdf", units="mm", width=180, height=180, dpi=300)
+
+
+```
+
+```{r PERMANOVA - per site community}
+#PERMANOVA for each site
+set.seed(42)
+#shallow
+shal_sedvegdist <- vegdist(asvs_subsed[grep("O", rownames(asvs_subsed)),], method="bray") %>% as.matrix()
+shal_sedvegdist.perm <- adonis2(shal_sedvegdist ~ date + date/replicate, data=meta[grep("O", meta$name),], permutations=9999, method="bray")
+shal_sedvegdist.perm
+#date is significant (0.0049) but R2 low (0.14677)
+p.adjust(0.0033, method="BH", n=2)
+
+#intermediate
+int_sedvegdist <- vegdist(asvs_subsed[grep("I", rownames(asvs_subsed)),], method="bray") %>% as.matrix()
+int_sedvegdist.perm <- adonis2(int_sedvegdist ~ date + date/replicate, data=meta[grep("I", meta$name),], permutations=9999, method="bray")
+int_sedvegdist.perm
+#date is significant (0.0054) but R2 low (0.17295)
+p.adjust(0.0048, method="BH", n=2)
+#adjusted to 0.0108. But maybe a bit silly?
+
+#deep
+deep_sedvegdist <- vegdist(asvs_subsed[grep("A", rownames(asvs_subsed)),], method="bray") %>% as.matrix()
+deep_sedvegdist.perm <- adonis2(deep_sedvegdist ~ date + date/replicate, data=meta[grep("A", meta$name),], permutations=9999, method="bray")
+deep_sedvegdist.perm
+#date is not significant (0.0762) but R2 low (0.10263)
+p.adjust(0.079, method="BH", n=2)
+#adjusted to 0.1524. But maybe a bit silly?
+```
+
+#ANCOMBC on Family
+
+```{r ANCOMBC - comparison month within each site on Family level}
+#Family abundance ~ month (reference =march)
+#make the right format for the otu-table
+sed_16S_wide <- sed_16S_counts%>% 
+ # filter(sample %in% c("X1001","X1002","X1003","X1010","X1011","X1012","X1019","X1020","X1021","X1028","X1029","X1030","X1037","X1038","X1039","X1046","X1047","X1048","X1057","X1058","X1059","X1066","X1067","X1068","X1075","X1076","X1077"))%>% #Shallow
+ #  filter(sample %in% c("X1004","X1005","X1006","X1013","X1014","X1015","X1022","X1023","X1024","X1031","X1032","X1033","X1040","X1041","X1042","X1049","X1050","X1051","X1060","X1061","X1062","X1069","X1070","X1071","X1078","X1079","X1080"))%>% #Intermediate
+   filter(sample %in% c("X1007","X1008","X1009","X1016","X1017","X1018","X1025","X1026","X1027","X1034","X1035","X1036","X1043","X1044","X1045","X1052","X1055","X1056","X1063","X1064","X1065","X1072","X1073","X1074","X1081","X1082","X1083"))%>% #Deep
+  dplyr::select(ASV_ID, sample, count) %>% #select ISV, sample and count
+  spread(sample,count, fill= 0) %>%
+  remove_rownames() %>% #remove of row names
+  column_to_rownames(var = "ASV_ID")
+
+#fix the taxa table
+taxa_16S<- taxa%>%  
+  remove_rownames() %>% #remove of row names
+  column_to_rownames(var = "ASV_ID")
+
+#fix meta table
+meta_16S<- meta2%>%  
+#    filter(sample %in% c("X1001","X1002","X1003","X1010","X1011","X1012","X1019","X1020","X1021","X1028","X1029","X1030","X1037","X1038","X1039","X1046","X1047","X1048","X1057","X1058","X1059","X1066","X1067","X1068","X1075","X1076","X1077"))%>% #Shallow
+ #  filter(sample %in% c("X1004","X1005","X1006","X1013","X1014","X1015","X1022","X1023","X1024","X1031","X1032","X1033","X1040","X1041","X1042","X1049","X1050","X1051","X1060","X1061","X1062","X1069","X1070","X1071","X1078","X1079","X1080"))%>% #Intermediate
+   filter(sample %in% c("X1007","X1008","X1009","X1016","X1017","X1018","X1025","X1026","X1027","X1034","X1035","X1036","X1043","X1044","X1045","X1052","X1055","X1056","X1063","X1064","X1065","X1072","X1073","X1074","X1081","X1082","X1083"))%>% #Deep
+  remove_rownames() %>% #remove of row names
+  column_to_rownames(var = "sample")
+
+#create a phyloseq object
+ps <- phyloseq( otu_table(sed_16S_wide, taxa_are_rows = TRUE),
+  tax_table(as.matrix(taxa_16S)),
+  sample_data(meta_16S))
+
+#aggregate to Family level
+ps_family <- tax_glom(ps, taxrank = "Family")
+
+
+sample_data(ps_family)$date <- as.factor(sample_data(ps_family)$date)
+sample_data(ps_family)$date<- relevel(sample_data(ps_family)$date, "2017-03-21")
+
+#Run ANCOMBC
+output = ancombc2(data = ps_family, assay_name = "counts", tax_level = "Family",
+                  fix_formula = "date", rand_formula = NULL,
+                  p_adj_method = "holm", pseudo_sens = TRUE,
+                  prv_cut = 0.10, lib_cut = 1000, s0_perc = 0.05,
+                  group = "date", struc_zero = TRUE, neg_lb = TRUE,
+                  alpha = 0.05, n_cl = 2, verbose = TRUE,
+                  global = TRUE, pairwise = TRUE, 
+                  dunnet = TRUE, trend = FALSE,
+                  iter_control = list(tol = 1e-5, max_iter = 20, 
+                                      verbose = TRUE),
+                  em_control = list(tol = 1e-5, max_iter = 100),
+                  lme_control = lme4::lmerControl(), 
+                  mdfdr_control =  list(fwer_ctrl_method = "holm", B = 100), 
+                  trend_control = list(contrast = list(matrix(c(1, 0, -1, 1),
+                                                              nrow = 2, 
+                                                              byrow = TRUE)),
+                                       node = list(2),
+                                       solver = "ECOS",
+                                       B = 10))
+
+res_table <- as.data.frame(output$res)
+#write.csv(res_table, "../data/16S_ampliseq/ANCOMBC_DA_16S/ANCOMBC2_output_Family_Taxa_Level_reference_March_Deep.csv")
+
+res_pair = as.data.frame(output$res_pair)
+#write.csv(res_pair, "../data/16S_ampliseq/ANCOMBC_DA_16S/ANCOMBC2_res_pair_output_Family_Taxa_Level_reference_March_Deep.csv")
+
+res_global = as.data.frame(output$res_global)
+#write.csv(res_global, "../data/16S_ampliseq/ANCOMBC_DA_16S/ANCOMBC2_res_global_output_Family_Taxa_Level_reference_March_Deep.csv")
+
+res_dunn = as.data.frame(output$res_dunn)
+#write.csv(res_dunn, "../data/16S_ampliseq/ANCOMBC_DA_16S/ANCOMBC2_res_dunn_output_Family_Taxa_Level_reference_March_Deep.csv")
+
+```
+
+```{r ANCOMBC - Figure Heatmap - individual}
+
+DA_S <- read.csv("../data/16S_ampliseq/ANCOMBC_DA_16S/ANCOMBC2_res_dunn_output_Family_Taxa_Level_reference_March_Shallow.csv", header=T) %>% remove_rownames() %>% column_to_rownames(var="taxon")
+DA_I <- read.csv("../data/16S_ampliseq/ANCOMBC_DA_16S/ANCOMBC2_res_dunn_output_Family_Taxa_Level_reference_March_Intermediate.csv", header=T)%>% remove_rownames() %>% column_to_rownames(var="taxon")
+DA_D <- read.csv("../data/16S_ampliseq/ANCOMBC_DA_16S/ANCOMBC2_res_dunn_output_Family_Taxa_Level_reference_March_Deep.csv", header=T)%>% remove_rownames() %>% column_to_rownames(var="taxon")
+
+#Shallow
+
+colnames(DA_S)
+head(DA_S)
+
+#Identify significance and LFC columns
+sig_cols_DA_S <- grep("^diff_date", colnames(DA_S), value = TRUE)
+
+lfc_cols_DA_S <- grep("^lfc_date", colnames(DA_S), value = TRUE)
+
+#Built a heatmap matrix 
+
+heat_DA_S <- data.frame(Family = rownames(DA_S))
+
+for(i in seq_len(min(length(sig_cols_DA_S),
+                     length(lfc_cols_DA_S)))) {
+
+  sig_col <- sig_cols_DA_S[i]
+  lfc_col <- lfc_cols_DA_S[i]
+
+  if(is.na(sig_col) || is.na(lfc_col))
+    next
+
+  new_name <- gsub("lfc_", "", lfc_col)
+
+  heat_DA_S[[new_name]] <-
+    ifelse(
+      as.logical(DA_S[[sig_col]]),
+      DA_S[[lfc_col]],
+      NA
+    )
+}
+
+
+#Keep only taxa with at least one significant result
+heat_DA_S <- heat_DA_S %>%
+  filter(rowSums(!is.na(across(-Family))) > 0)
+
+#Convert to long-format 
+
+heat_long_DA_S <- heat_DA_S %>%
+  pivot_longer(
+    -Family,
+    names_to = "Contrast",
+    values_to = "LFC"
+  )
+
+
+
+#Making it public ready
+family_order_DA_S <- heat_long_DA_S %>%
+  group_by(Family) %>%
+  summarise(max_abs = max(abs(LFC), na.rm = TRUE)) %>%
+  arrange(max_abs)
+
+heat_long_DA_S$Family <- factor(
+  heat_long_DA_S$Family,
+  levels = family_order_DA_S$Family
+)
+
+#PLot
+
+ggplot(heat_long_DA_S,
+       aes(x = Contrast,
+           y = Family,
+           fill = LFC)) +
+  geom_tile(color = "grey90") +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0,
+    na.value = "white"
+  ) +
+  theme_bw() +
+  labs(
+    x = "Month vs March",
+    y = "Family",
+    fill = "logFC"
+  )
+
+
+#Intermediate
+#Identify significance and LFC columns
+sig_cols_DA_I <- grep("^diff_date", colnames(DA_I), value = TRUE)
+
+lfc_cols_DA_I <- grep("^lfc_date", colnames(DA_I), value = TRUE)
+
+#Built a heatmap matrix 
+
+heat_DA_I <- data.frame(Family = rownames(DA_I))
+
+for(i in seq_len(min(length(sig_cols_DA_I),
+                     length(lfc_cols_DA_I)))) {
+
+  sig_col <- sig_cols_DA_I[i]
+  lfc_col <- lfc_cols_DA_I[i]
+
+  if(is.na(sig_col) || is.na(lfc_col))
+    next
+
+  new_name <- gsub("lfc_", "", lfc_col)
+
+  heat_DA_I[[new_name]] <-
+    ifelse(
+      as.logical(DA_I[[sig_col]]),
+      DA_I[[lfc_col]],
+      NA
+    )
+}
+
+
+#Keep only taxa with at least one significant result
+heat_DA_I <- heat_DA_I %>%
+  filter(rowSums(!is.na(across(-Family))) > 0)
+
+#Convert to long-format 
+
+heat_long_DA_I <- heat_DA_I %>%
+  pivot_longer(
+    -Family,
+    names_to = "Contrast",
+    values_to = "LFC"
+  )
+
+
+
+#Making it public ready
+family_order_DA_I <- heat_long_DA_I %>%
+  group_by(Family) %>%
+  summarise(max_abs = max(abs(LFC), na.rm = TRUE)) %>%
+  arrange(max_abs)
+
+heat_long_DA_I$Family <- factor(
+  heat_long_DA_I$Family,
+  levels = family_order_DA_I$Family
+)
+
+#PLot
+
+ggplot(heat_long_DA_I,
+       aes(x = Contrast,
+           y = Family,
+           fill = LFC)) +
+  geom_tile(color = "grey90") +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0,
+    na.value = "white"
+  ) +
+  theme_bw() +
+  labs(
+    x = "Month vs March",
+    y = "Family",
+    fill = "logFC"
+  )
+
+
+#Deep
+#Identify significance and LFC columns
+sig_cols_DA_D <- grep("^diff_date", colnames(DA_D), value = TRUE)
+
+lfc_cols_DA_D <- grep("^lfc_date", colnames(DA_D), value = TRUE)
+
+#Built a heatmap matrix 
+
+heat_DA_D <- data.frame(Family = rownames(DA_D))
+
+for(i in seq_len(min(length(sig_cols_DA_D),
+                     length(lfc_cols_DA_D)))) {
+
+  sig_col <- sig_cols_DA_D[i]
+  lfc_col <- lfc_cols_DA_D[i]
+
+  if(is.na(sig_col) || is.na(lfc_col))
+    next
+
+  new_name <- gsub("lfc_", "", lfc_col)
+
+  heat_DA_D[[new_name]] <-
+    ifelse(
+      as.logical(DA_D[[sig_col]]),
+      DA_D[[lfc_col]],
+      NA
+    )
+}
+
+
+#Keep only taxa with at least one significant result
+heat_DA_D <- heat_DA_D %>%
+  filter(rowSums(!is.na(across(-Family))) > 0)
+
+#Convert to long-format 
+
+heat_long_DA_D <- heat_DA_D %>%
+  pivot_longer(
+    -Family,
+    names_to = "Contrast",
+    values_to = "LFC"
+  )
+
+
+
+#Making it public ready
+family_order_DA_D <- heat_long_DA_D %>%
+  group_by(Family) %>%
+  summarise(max_abs = max(abs(LFC), na.rm = TRUE)) %>%
+  arrange(max_abs)
+
+heat_long_DA_D$Family <- factor(
+  heat_long_DA_D$Family,
+  levels = family_order_DA_D$Family
+)
+
+#PLot
+
+ggplot(heat_long_DA_D,
+       aes(x = Contrast,
+           y = Family,
+           fill = LFC)) +
+  geom_tile(color = "grey90") +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0,
+    na.value = "white"
+  ) +
+  theme_bw() +
+  labs(
+    x = "Month vs March",
+    y = "Family",
+    fill = "logFC"
+  )
+
+
+```
+
+```{r ANCOMBC - Figure6}
+#Include the sites as a column
+heat_long_DA_S$Site <- "Shallow"
+heat_long_DA_I$Site <- "Intermediate"
+heat_long_DA_D$Site <- "Deep"
+
+#combine the three long format into one
+heat_all <- bind_rows(
+  heat_long_DA_S,
+  heat_long_DA_I,
+  heat_long_DA_D
+)
+
+#Make summary table for supplemental file
+#heat_all_wo_NA <- heat_all %>% na.omit()
+
+#write.csv(heat_all_wo_NA, "../figure/Supplemental_data/Supplemental_table_S4_DA_analysis_combined_sites_only_sig_LFC.csv")
+
+#df_summary <- heat_all_wo_NA %>%
+#  group_by(Family) %>%
+ # summarise(
+  #  contrasts = paste(Contrast, collapse = "; "),
+  #  LFC_range = paste0(round(min(LFC),2), " to ", round(max(LFC),2)),
+   # sites = paste(unique(Site), collapse = "; ")
+  #)
+#write.csv(df_summary, "../data/16S_ampliseq/ANCOMBC_DA_16S/DA_analysis_combined_sites_only_sig_LFC.csv")
+
+#remove the date in contrast
+heat_all$Contrast <- gsub("^date", "", heat_all$Contrast)
+
+#reorder the sites
+heat_all$Site <- factor(
+  heat_all$Site,
+  levels = c(
+    "Shallow",
+    "Intermediate",
+    "Deep"
+  )
+)
+
+
+
+#only keep families with the largest respond (largest abslute changes) - top 20
+top_families <- heat_all %>%
+  group_by(Family) %>%
+  summarise(max_abs = max(abs(LFC), na.rm = TRUE)) %>%
+  arrange(desc(max_abs)) %>%
+  slice_head(n = 20) %>%
+  pull(Family)
+
+heat_top <- heat_all %>%
+  filter(Family %in% top_families)
+
+#Heatmap
+max_lfc <- max(abs(heat_top$LFC), na.rm = TRUE)
+
+ANCOMBC_heatmap<- ggplot(
+  heat_top,
+  aes(x = Contrast,
+      y = Family,
+      fill = LFC)
+) +
+  geom_tile(color = "grey90") +
+  facet_wrap(~Site, nrow = 1) +
+scale_fill_gradient2(
+  low = "#4575B4",
+  mid = "white",
+  high = "#B2182B",
+  midpoint = 0,
+  limits = c(-max_lfc, max_lfc),
+  na.value = "grey96"
+) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(
+      angle = 90,
+      hjust = 1
+    )
+  )+ xlab("Date")
+
+#ggsave(
+#  "../figure/Figure_pdf/Fig6_ANCOMBC_heatmap.pdf",
+#  plot = ANCOMBC_heatmap
+#)
+```
+
+```{r session Info}
+sessionInfo()
+```
+

@@ -1,0 +1,1508 @@
+---
+title: "RNA_analysis"
+author: "Emelie"
+date: "26/1/2022 updated 23/6/2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(tidyr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(DESeq2)
+library(ashr)
+library(pheatmap)
+library(RColorBrewer)
+library(stringr)
+library(vegan)
+library(WGCNA)
+library(limma)
+library(ggpubr)
+```
+
+```{r load data}
+
+counts <- read_tsv("../data/RNA/Metatdenovo/Metatdenovo/summary_tables/megahit.prokka.counts.tsv.gz", 
+                   col_types = cols(.default = col_double(), 
+                                    orf = col_character(), 
+                                    chr = col_character(), 
+                                    strand = col_character(), 
+                                    sample = col_character())) 
+
+#getting metadata in there
+metadata <- read_csv("../data/RNA/rna_meta.csv", 
+                     col_types=cols(.default=col_double(), 
+                                    sample=col_character(),
+                                    name=col_character(), 
+                                    sampleRNA=col_character(), 
+                                    season=col_character(),
+                                    month=col_character(), 
+                                    date=col_date(format="%d/%m/%Y"), 
+                                    sampletag=col_character(), 
+                                    site=col_character(), 
+                                    group=col_character(), 
+                                    oxygenstate=col_character(), 
+                                    type=col_character()))
+
+#generalising "name" so that it can be used for a design matrix to compare the sites and months, now called group
+metadata$group <- sub("[1-3]_", "_", metadata$name)
+#to refer to sites etc as shallow and deep and not oxic and anoxic
+metadata$group <- sub("O", "S", metadata$group)
+metadata$group <- sub("A", "D", metadata$group)
+metadata$sample <- sub("_L001", "", metadata$sample)
+
+#sorting the metadata to have the same order as names in the counts_matrix
+#metadata <- metadata %>% arrange(name)
+
+#adding names to counts
+counts <- left_join(counts, metadata[,1:2], by="sample")
+
+
+#load taxonomy data
+taxa <- read_tsv("../data/RNA/Metatdenovo/Metatdenovo/summary_tables/megahit.prokka.gtdb.diamond.taxonomy.tsv.gz", col_types=cols(.default=col_character()))
+
+#load functional annotations
+eggs <- read_tsv("../data/RNA/Metatdenovo/Metatdenovo/summary_tables/megahit.prokka.emapper.tsv.gz", col_types=cols(.default=col_character(), evalue=col_double(), score=col_double()))
+
+#and descriptions of cog classes
+cogs <- read_tsv("../data/RNA/kog_classes.txt", col_types=cols(.default=col_character()) , col_names=c("cog_category", "cog_group_def"))
+
+#and adding the descriptions to func
+eggs <- left_join(eggs, cogs[-1,], by="cog_category")
+
+
+#filtrera score>30
+kofam <- read_tsv("../data/RNA/Metatdenovo/Metatdenovo/summary_tables/megahit.prokka.kofamscan.tsv.gz", col_types=cols(.default=col_character(), thrshld=col_double(), score=col_double(), "evalue"=col_double()))
+kofam <- kofam[-1,-1]
+colnames(kofam)[1] <- "orf"
+colnames(kofam)[6] <- "ko_def"
+
+#selecting by largest score and removing duplicates, just taking first
+kofam <- kofam %>%
+  group_by(orf) %>%
+  slice_max(order_by=score, n=1, with_ties=FALSE) %>%
+  ungroup()
+
+#checking that they're all unique
+kofam %>% 
+  group_by(orf) %>% 
+  filter(n()>1)
+
+
+all_annot <- full_join(eggs, taxa, by="orf") %>% 
+  full_join(kofam, by="orf")
+
+
+```
+
+```{r bonus stats}
+#bonus stats
+#no of orfs
+length(unique(counts$orf))
+#no of contigs
+length(unique(counts$chr))
+#no of annotated orfs at diff levels based on all taxonomic annotations
+taxa2 <- gsub(".*uncl.*", NA, as.matrix(taxa)) %>% as.data.frame()
+length(as.matrix(taxa))
+na_count <-sapply(taxa2, function(y) sum(is.na(y)))
+na_count <- as.data.frame(na_count)
+na_count$all_count <- c(2392995,2392995,2392995,2392995,2392995,2392995,2392995,2392995,2392995,2392995,2392995)
+na_count$percent_na <- na_count$na_count/na_count$all_count*100
+na_count$percent_anno <- 100-na_count$percent_na
+na_count
+
+#checking how many entries in taxa/eggs/kofam that match those in counts
+semi_join(taxa, counts, by="orf") 
+semi_join(eggs, counts, by="orf") 
+semi_join(kofam, counts, by="orf")
+```
+
+```{r input Deseq2}
+#create input for deseq2
+count_matrix <- counts %>%
+  select(c(orf, count, name)) %>% 
+  pivot_wider(names_from=name, values_from=count, values_fill=0) %>% 
+  column_to_rownames(var="orf")
+
+meta <- metadata %>% column_to_rownames("name")
+
+#checking ordering of samples
+all(rownames(meta) %in% colnames(count_matrix))
+all(rownames(meta) == colnames(count_matrix))
+
+#make deseq-input-object
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = meta,
+                              design = ~ 0 + group)
+#design "~ 0 + site + season" is full model, and design "~ 0 + site" is reduced model
+#this would "in order to test for any differences over multiple time points, one can use a design including the time factor, and then test using the likelihood ratio test as described in the following section, where the time factor is removed in the reduced formula." from https://www.r-bloggers.com/2021/04/note-for-deseq2-time-course-analysis/
+
+# be explicit with sites+months as 1 variable and have that as the design, and then pull out specific contrasts. Yes.
+```
+
+```{r DESeq analysis}
+#deseq2 analysis
+#pre-filtering
+keep <- rowSums(counts(dds) >= 10) >= 2
+table(keep) #162549 false, 54240 true
+#de-analysis
+dds <- DESeq(dds)
+
+#norm factors
+sizeFactors(dds)
+plotDispEsts(dds)
+
+#results
+res <- results(dds, independentFiltering=TRUE, alpha=0.05, pAdjustMethod="BH", parallel=TRUE)
+res <- lfcShrink(dds, res=res, type="ashr")
+res
+
+summary(res)
+
+plotMA(res, ylim=c(-12,12))
+```
+
+#PCA 
+```{r PCA - transcripts - Figure 7}
+#"Data quality assessment by sample clustering and visualisation"
+select <- order(rowMeans(counts(dds, normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+
+df <- as.data.frame(colData(dds)[,c("group")])
+ntd <- normTransform(dds)
+rownames(df) <- colnames(ntd)
+colnames(df) <- "group"
+
+phcols <- c("D_december"="red", "D_october"="darkred", "D_june"="maroon", "D_march"="darkorange", "I_december"="darkgreen", "I_october"="green3", "I_june"="#009E73", "I_march"="palegreen2", "S_december"="blue", "S_october"="darkblue", "S_june"="#56B4E9", "S_march"="steelblue")
+
+vsd <- vst(dds, blind=FALSE)
+
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$group)
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+
+#PCA of samples
+plotPCA(vsd, intgroup=c("group"))
+
+pcaData <- plotPCA(vsd, intgroup=c("group"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+#rename samples
+pcaData$group <- dplyr::recode(pcaData$group,
+  "S_march"    = "Shallow_March",
+  "S_june"     = "Shallow_June",
+  "S_october"  = "Shallow_October",
+  "S_december" = "Shallow_December",
+  "I_march"    = "Intermediate_March",
+  "I_june"     = "Intermediate_June",
+  "I_october"  = "Intermediate_October",
+  "I_december" = "Intermediate_December",
+  "D_march"    = "Deep_March",
+  "D_june"     = "Deep_June",
+  "D_october"  = "Deep_October",
+  "D_december" = "Deep_December"
+)
+#reorder sample names
+pcaData$group <- factor(
+  pcaData$group,
+  levels = c(
+    "Shallow_March", "Shallow_June", "Shallow_October", "Shallow_December",
+    "Intermediate_March", "Intermediate_June", "Intermediate_October", "Intermediate_December",
+    "Deep_March", "Deep_June", "Deep_October", "Deep_December"
+  )
+)
+#give them each a color
+pca_cols <- c(
+  "Shallow_March"        = "steelblue",
+  "Shallow_June"         = "#56B4E9",
+  "Shallow_October"      = "darkblue",
+  "Shallow_December"     = "blue",
+  "Intermediate_March"   = "palegreen2",
+  "Intermediate_June"    = "#009E73",
+  "Intermediate_October" = "green3",
+  "Intermediate_December"= "darkgreen",
+  "Deep_March"           = "darkorange",
+  "Deep_June"            = "maroon",
+  "Deep_October"         = "darkred",
+  "Deep_December"        = "red"
+)
+#plot the PCA
+ggplot(pcaData, aes(PC1, PC2, color = group)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = pca_cols,
+                      guide = guide_legend(ncol = 3)) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  theme_bw() +
+  theme(
+    text = element_text(size = 6),
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    legend.box.margin = margin(-10, 10, -10, -10)
+  )
+
+#ggsave("../figure/Figure_pdf/fig7_transcriptpca.pdf", width=90, height=90, units="mm", dpi=300)
+```
+
+```{r PERMANOVA - site & temporal comparison}
+#We use a PERMANOVA on vst/rlog transformed data with eucliden distance using the DESeq2 transcript data, as vst stabilize the variance and the PCA already is based on the transformed data. 
+
+#matrix vsd
+vsd <- vst(dds, blind = FALSE)
+#prepare data matrix
+expr <- t(assay(vsd))   # samples x genes
+meta_vsd <- as.data.frame(colData(dds))
+
+
+#distance matrix
+dist_expr <- dist(expr, method = "euclidean")
+
+#Overall PERMANOVA
+perm_all <- adonis2(dist_expr ~ site * month, data = meta_vsd, permutations = 999)
+perm_all
+#Model is significant p=0.001, R2=0.76, which means 77 % of the variation are explained by the model (site * month) 
+
+#now test termwise to check what is the important facotr?
+perm_all_terms <- adonis2(dist_expr ~ site * month,
+                          data = meta_vsd,
+                          permutations = 999,
+                          by = "terms")
+perm_all_terms
+
+#PERMANOVA based on variance-stabilized transcript counts showed that transcriptional profiles differed significantly among samples when site, month, and their interaction were considered together (R² = 0.77, p = 0.001), indicating that habitat-specific oxygen regime and seasonal dynamics strongly structure microbial transcriptional activity.
+
+#transcript profiles are significant for site, month and site*month
+# site strongest effect: R2=0.356 p=0.001 35.6% explained
+#month significant R=0.175, p=0.001 17.5 % explained 
+# clear seasonal effect but weaker than site, which means the seasonal variation are within habitat/regime frame
+#site*month interaction also significant R=0.239, p=0.001
+#seasonal changes are different depending on the site, means the sites change different during the season. so it depends on the regime, how they change
+
+#Test for dispersion for site
+bd_site <- betadisper(dist_expr, meta_vsd$site)
+anova(bd_site)
+permutest(bd_site)
+#dispersion for site is significant p=0.001
+#Test dispersion for month
+bd_month <- betadisper(dist_expr, meta_vsd$month)
+anova(bd_month)
+permutest(bd_month)
+#p=0.089
+
+#Within sites PERMANOVA
+#To test which site is strongest influences by seasonal changes
+
+#Shallow
+keep_sh <- meta_vsd$site == "Shallow"
+
+expr_sh <- expr[keep_sh, , drop = FALSE]
+meta_sh <- meta_vsd[keep_sh, , drop = FALSE]
+
+dist_sh <- dist(expr_sh, method = "euclidean")
+
+perm_sh <- adonis2(dist_sh ~ month, data = meta_sh, permutations = 999)
+perm_sh
+
+#p=0.001 R2=0.627
+
+#Intermediate
+keep_int <- meta_vsd$site == "Intermediate"
+
+expr_int <- expr[keep_int, , drop = FALSE]
+meta_int <- meta_vsd[keep_int, , drop = FALSE]
+
+dist_int <- dist(expr_int, method = "euclidean")
+
+perm_int <- adonis2(dist_int ~ month, data = meta_int, permutations = 999)
+perm_int
+
+#p=0.001, R2=0.74
+
+
+#Deep
+keep_dp <- meta_vsd$site == "deep"
+
+expr_dp <- expr[keep_dp, , drop = FALSE]
+meta_dp <- meta_vsd[keep_dp, , drop = FALSE]
+
+dist_dp <- dist(expr_dp, method = "euclidean")
+
+perm_dp <- adonis2(dist_dp ~ month, data = meta_dp, permutations = 999)
+perm_dp
+#p=0.001 , R=0.55
+
+#Benjamin hochberg correction for the p-values
+pvals <- c(0.001, 0.001, 0.001)
+p.adjust(pvals, method = "BH")
+
+#Shallow
+bd_sh <- betadisper(dist_sh, meta_sh$month)
+anova(bd_sh)
+permutest(bd_sh)
+#p=.725
+
+#Intermediate
+bd_int <- betadisper(dist_int, meta_int$month)
+anova(bd_int)
+permutest(bd_int)
+
+#p=0.037
+
+#Deep
+bd_dp <- betadisper(dist_dp, meta_dp$month)
+anova(bd_dp)
+permutest(bd_dp)
+
+#p=0.22
+
+#Intermediate: strong seasonal effect with 74% R2 but also the dispersion is significant, which could mean that partially the effect could be due to different variability between month and not only due to community shifts.
+
+#Overall: depth-dependent seasonal transcriptomic dynamics
+```
+
+#WGCNA analysis
+
+```{r prep for WGCNA - Figure 8}
+#prep for WGCNA
+#some rougher filtering
+keep2 <- rowSums(counts(dds) >= 20) >= 2
+table(keep2) #17597 false, 19001 true
+dds2 <- dds[keep2,]
+vsd2 <- vst(dds2, blind=FALSE)
+#from deseq2 output, need to split based on site
+#checking input for genes or samples with too many missing values
+gsg <- goodSamplesGenes(assay(vsd2), verbose = 3)
+gsg$allO
+
+#checking samples to see if there's any obvious outliers
+sampleTree <- hclust(dist(assay(vsd2) %>% t()), method="average")
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+
+#deep
+norm_counts_deep <- assay(vsd2) %>% 
+  as.data.frame() %>% 
+  select(starts_with("A")) %>% 
+  t()
+
+gsg <- goodSamplesGenes(norm_counts_deep, verbose = 3)
+gsg$allO
+
+if (!gsg$allOK) {
+# Optionally, print the gene and sample names that were removed: 
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:", paste(names(norm_counts_deep)[!gsg$goodGenes], collapse = ", ")));
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:", paste(rownames(norm_counts_deep)[!gsg$goodSamples], collapse = ", "))); 
+# Remove the offending genes and samples from the data: 
+  norm_counts_deep <- norm_counts_deep[gsg$goodSamples, gsg$goodGenes]
+}
+
+sampleTree <- hclust(dist(norm_counts_deep), method="average")
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+
+#intermediate
+norm_counts_int <- assay(vsd2) %>% 
+  as.data.frame() %>% 
+  select(starts_with("I")) %>% 
+  t()
+
+gsg <- goodSamplesGenes(norm_counts_int, verbose = 3)
+gsg$allO
+
+if (!gsg$allOK) {
+# Optionally, print the gene and sample names that were removed: 
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:", paste(names(norm_counts_int)[!gsg$goodGenes], collapse = ", ")));
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:", paste(rownames(norm_counts_int)[!gsg$goodSamples], collapse = ", "))); 
+# Remove the offending genes and samples from the data: 
+  norm_counts_int <- norm_counts_int[gsg$goodSamples, gsg$goodGenes]
+}
+
+sampleTree <- hclust(dist(norm_counts_int), method="average")
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+
+#shallow
+norm_counts_shal <- assay(vsd2) %>% 
+  as.data.frame() %>% 
+  select(starts_with("O")) %>% 
+  t()
+
+gsg <- goodSamplesGenes(norm_counts_shal, verbose = 3)
+gsg$allO
+
+if (!gsg$allOK) {
+# Optionally, print the gene and sample names that were removed: 
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:", paste(names(norm_counts_shal)[!gsg$goodGenes], collapse = ", ")));
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:", paste(rownames(norm_counts_shal)[!gsg$goodSamples], collapse = ", "))); 
+# Remove the offending genes and samples from the data: 
+  norm_counts_shal <- norm_counts_shal[gsg$goodSamples, gsg$goodGenes]
+}
+
+sampleTree <- hclust(dist(norm_counts_shal), method="average")
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+```
+
+```{r Function to get more top genes}
+#function to get more top genes
+chooseTopHubInEachModule2 <- function(datExpr, colorh, omitColors = "grey", power = 2, type = "signed", 
+                                      numTopGenesPerModule = 1, ...) 
+{
+    isIndex = FALSE
+    modules = names(table(colorh))
+    if (!(is.na(omitColors)[1])) 
+        modules = modules[!is.element(modules, omitColors)]
+    if (is.null(colnames(datExpr))) {
+        colnames(datExpr) = 1:dim(datExpr)[2]
+        isIndex = TRUE
+    }
+    hubs = vector("list", length = length(modules))
+    names(hubs) = modules
+    for (m in modules) {
+        adj = adjacency(datExpr[, colorh == m], power = power, type = type, ...)
+        # Select the top genes based on numTopGenesPerModule
+        hub_indices = order(rowSums(adj), decreasing = TRUE)[1:min(numTopGenesPerModule, ncol(adj))]
+        hubs[[m]] = colnames(adj)[hub_indices]
+    }
+    if (isIndex) {
+        hubs = lapply(hubs, as.numeric)
+        names(hubs) = modules
+    }
+    return(hubs)
+}
+```
+
+###DEEP
+```{r DEEP - test WGCNA}
+#DEEP
+#testing WGCNA, tutorial from https://bioinformaticsworkbook.org/dataAnalysis/RNA-Seq/RNA-SeqIntro/wgcna.html#gsc.tab=0
+#to make copy-pasting easier, rename data to input_mat
+assign("input_mat", norm_counts_deep)
+#assign("input_mat", norm_counts_int)
+#assign("input_mat", norm_counts_shal)
+
+#allow WGCNA two threads
+allowWGCNAThreads(2)
+
+# Choose a set of soft-threshold powers
+#powers = c(c(1:10), seq(from = 12, to = 20, by = 2))
+powers2 = c(c(1:10), seq(from =10, to=30, by=1))
+```
+
+```{r DEEP - more WGCNA}
+#DEEP
+assign("input_mat", norm_counts_deep)
+picked_power = 18
+#assign("input_mat", norm_counts_int)
+#picked_power = 12
+#assign("input_mat", norm_counts_shal)
+#picked_power = 10
+ temp_cor <- cor
+ cor <- WGCNA::cor         # Force it to use WGCNA cor function (fix a namespace conflict issue)
+# #netwk_deep
+# #netwk_int
+ netwk_deep <- blockwiseModules(input_mat,                # <= input here
+ 
+                           # == Adjacency Function ==
+                           power = picked_power,                # <= power here
+                          networkType = "signed",
+ 
+                           # == Tree and Block Options ==
+                           #deepSplit = 2,
+                           #pamRespectsDendro = F,
+                           # detectCutHeight = 0.75,
+                           #minModuleSize = 30,
+                           maxBlockSize = 5000,# 
+                           # == Module Adjustments ==
+                           reassignThreshold = 0,
+                           mergeCutHeight = 0.25,
+ 
+                           # == TOM == Archive the run results in TOM file (saves time)
+                           saveTOMs = T,
+                           saveTOMFileBase = "ER",
+ 
+                           # == Output Options
+                           numericLabels = T,
+                           verbose = 3,
+                           randomSeed=42,)
+# 
+# cor <- temp_cor     # Return cor function to original namespace
+
+#Let’s take a look at the modules, there
+
+assign("netwk", netwk_deep)
+#assign("netwk", netwk_int)
+#assign("netwk", netwk_shal)
+
+# Convert labels to colors for plotting
+mergedColors = labels2colors(netwk$colors)
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(
+  netwk$dendrograms[[1]],
+  mergedColors[netwk$blockGenes[[1]]],
+  "Module colors",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05 )
+
+### netwk$colors[netwk$blockGenes[[1]]]
+table(netwk$colors)
+
+#deep 50-smth clusters, clusters until 31 >100, until 7 >500
+#int 30-smth clusters, clusters until 20 >100, until 5 >500
+#shal 30-smth clusters, 
+
+###
+#WGCNA results scruitiny
+#We can pull out the list of modules
+
+module_df <- data.frame(
+  gene_id = names(netwk$colors),
+  label = gsub("^", "ME", netwk$colors),
+  colors = labels2colors(netwk$colors)
+  ) %>% remove_rownames()
+
+numcol <- unique(module_df[,2:3])
+
+module_df[1:5,]
+
+#write_delim(module_df, file = "gene_modules_deep.txt", delim = "\t")
+#write_delim(module_df, file = "gene_modules_int.txt", delim = "\t")
+#write_delim(module_df, file = "gene_modules_shal.txt", delim = "\t")
+#We have written out a tab delimited file listing the genes and their modules. However, we need to figure out which modules are associated with each trait/treatment group. WGCNA will calcuate an Eigangene (hypothetical central gene) for each module, so it easier to determine if modules are associated with different treatments
+
+# Get Module Eigengenes per cluster
+MEs0 <- moduleEigengenes(input_mat, mergedColors)$eigengenes
+
+# Reorder modules so similar modules are next to each other
+MEs0 <- orderMEs(MEs0)
+module_order <- names(MEs0) %>% gsub("ME","", .)
+
+# Add treatment names
+MEs0$treatment <- row.names(MEs0)
+
+# tidy & plot data
+mME <- MEs0 %>%
+  pivot_longer(-treatment) %>%
+  mutate(
+    name = gsub("ME", "", name),
+    name = factor(name, levels = module_order)
+  ) %>% 
+  left_join(numcol, by=c("name"="colors"))
+
+mME %>% ggplot(., aes(x=treatment, y=label, fill=value)) +
+  geom_tile() +
+  theme_bw() +
+  scale_fill_gradient2(
+    low = "blue",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limit = c(-1,1)) +
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Module-month Relationships, deep", y = "Modules", fill="corr")
+
+orderperseason <- c("A1_march","A2_march","A3_march","A1_june","A2_june","A3_june","A1_october","A2_october","A3_october","A1_december","A2_december","A3_december")
+#orderperseason <- c("I1_march","I2_march","I1_june","I3_june","I1_october","I2_october","I3_october","I1_december","I2_december","I3_december")
+#orderperseason <- c("O1_march","O2_march","O3_march","O1_june","O2_june","O3_june","O1_october","O2_october","O3_october","O1_december","O2_december","O3_december")
+
+mME$treatment <- factor(mME$treatment, levels=orderperseason)
+
+forclust <- mME[,-2] %>% pivot_wider(names_from=treatment, values_from=value, values_fill=0) %>% column_to_rownames("label")
+clust <- hclust(dist(forclust))
+
+mME %>% ggplot(., aes(x=treatment, y=label, fill=value)) +
+  geom_tile() +
+  theme_bw() +
+  scale_fill_gradient2(
+    low = "blue",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limit = c(-1,1)) +
+  scale_y_discrete(limits = rownames(forclust)[clust$order]) +
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Ordered per season, deep", y = "Modules", fill="corr")
+
+
+#ggsave("genemodulesperseason_deep.pdf")
+#ggsave("genemodulesperseason_intermediate.pdf")
+#ggsave("genemodulesperseason_shallow.pdf")
+
+
+
+```
+
+```{r DEEP - WGCNA}
+#DEEP
+#following https://alexslemonade.github.io/refinebio-examples/04-advanced-topics/network-analysis_rnaseq_01_wgcna.html from 4.9 and on
+module_eigengenes <- netwk$MEs
+
+# Print out a preview
+head(module_eigengenes)
+
+#First we double check that our samples are still in order.
+all.equal(metadata$name[grep('A', metadata$name)], rownames(module_eigengenes))
+#all.equal(metadata$name[grep('I', metadata$name)], rownames(module_eigengenes))
+#all.equal(metadata$name[grep('O', metadata$name)], rownames(module_eigengenes))
+
+# Create the design matrix from the `date` variable
+des_mat <- model.matrix(~ metadata[grep('A', metadata$name),]$season)
+#des_mat <- model.matrix(~ metadata[grep('I', metadata$name),]$season)
+#des_mat <- model.matrix(~ metadata[grep('O', metadata$name),]$season)
+
+colnames(des_mat) <- c("(Intercept)", "spring", "summer", "winter")
+
+#Run linear model on each module. Limma wants our tests to be per row, so we also need to transpose so the eigengenes are rows
+# lmFit() needs a transposed version of the matrix
+fit <- limma::lmFit(t(module_eigengenes), design = des_mat)
+
+# Apply empirical Bayes to smooth standard errors
+fit <- limma::eBayes(fit)
+
+# Apply multiple testing correction and obtain stats
+stats_df <- limma::topTable(fit, number = ncol(module_eigengenes)) %>%
+  tibble::rownames_to_column("module")
+
+head(stats_df)
+
+module_eigeng_df <- module_eigengenes %>%
+  tibble::rownames_to_column("name") %>%
+  # Here we are performing an inner join with a subset of metadata
+  dplyr::inner_join(metadata %>% dplyr::select(name, season),  by = "name")
+
+assign("module_eigeng_df_deep", module_eigeng_df)
+assign("stats_df_deep", stats_df)
+#assign("module_eigeng_df_int", module_eigeng_df)
+#assign("stats_df_int", stats_df)
+#assign("module_eigeng_df_shal", module_eigeng_df)
+#assign("stats_df_shal", stats_df)
+
+ggplot(
+  module_eigeng_df,
+  aes(x = season, y = ME6)) +
+  geom_point() +
+  theme_classic()
+
+```
+
+```{r DEEP - WGCNA correlated with season}
+#DEEP
+#from interwebs: https://wikis.utexas.edu/display/bioiteam/Clustering+using+WGCNA
+# Correlate traits --------------------------------------------------------
+ 
+#Define number of genes and samples
+nGenes = ncol(input_mat)
+nSamples = nrow(input_mat)
+#Recalculate MEs with color labels
+#MEs0 = moduleEigengenes(input_mat, mergedColors)$eigengenes #done previously
+#MEs0 = orderMEs(MEs0) #done previously
+#getting the traits we want to look at
+#replace in grep, A/I/O
+traits <- metadata[grep('A', metadata$name),] %>%
+  column_to_rownames("name") %>%
+  mutate(
+    march=case_when(
+      season == "Spring" ~ 1,
+      TRUE               ~ 0
+    ),
+    june=case_when(
+      season == "Summer" ~ 1,
+      TRUE               ~ 0
+    ),
+    october=case_when(
+      season == "Fall" ~ 1,
+      TRUE               ~ 0
+    ),
+    december=case_when(
+      season == "Winter" ~ 1,
+      TRUE               ~ 0
+    )
+  ) %>% 
+  select(c("march", "june", "october", "december"))
+#only use the months to compare with the limma model, not: "oxygen1", "temperature", "sulfate", "organicmatter", "phosphate", "total iron", "pH", "nitrate"
+
+numcol$colors2 <- gsub("^", "ME", numcol$colors)
+
+MEs02 <- t(select(MEs0, -"treatment")) %>% as.data.frame() %>% rownames_to_column("colors2") %>% left_join(numcol, by="colors2") %>% column_to_rownames("label") %>% select(-c("colors", "colors2")) %>% t() %>% as.data.frame()
+
+#change columns
+moduleTraitCor <- WGCNA::cor(MEs02, traits, use="p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples)
+
+#filter data based on p-value
+moduleTraitPvalue[moduleTraitPvalue>0.05] <- NA
+moduleTraitPvalue <- moduleTraitPvalue[rowSums(is.na(moduleTraitPvalue)) != ncol(moduleTraitPvalue),]
+
+moduleTraitCor <- moduleTraitCor[rownames(moduleTraitCor) %in% rownames(moduleTraitPvalue),]
+moduleTraitCor[is.na(moduleTraitPvalue)] <- NA
+
+#Print correlation heatmap between modules and traits
+textMatrix= paste(signif(moduleTraitCor, 2), "\n(",
+                        signif(moduleTraitPvalue, 1), ")", sep= "")
+dim(textMatrix)= dim(moduleTraitCor)
+colnames(textMatrix) <- colnames(moduleTraitCor)
+rownames(textMatrix) <- rownames(moduleTraitCor)
+textMatrix <- gsub("\\\n\\(NA\\)", "", textMatrix)
+ 
+#display the corelation values with a heatmap plot
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+#pdf(file="heatmap_traits_deep.pdf")
+labeledHeatmap(Matrix= moduleTraitCor,
+            xLabels= names(traits),
+            yLabels= rownames(moduleTraitCor),
+            ySymbols= rownames(moduleTraitCor),
+            #colorLabels= TRUE,
+            colors= blueWhiteRed(50),
+            textMatrix= textMatrix,
+            setStdMargins= FALSE,
+            cex.text= 0.5,
+            zlim= c(-1,1),
+            main= paste("Module-month relationships, deep"))
+#INCLUDE THE NEXT LINE TO SAVE TO FILE
+#dev.off()
+
+#look at what modules are identified by both this approach and the limma approach
+sigmods <- moduleTraitCor %>% as.data.frame() %>% rownames_to_column(var="module") %>% right_join(stats_df[stats_df$adj.P.Val<0.05,], by="module") %>% select(module) %>% unname() %>% as.vector() %>% unlist()
+
+#adjust modules based on res above
+#deep, 11 modules: 1, 2, 3, 4, 7, 14, 19, 25, 28, 31, 50
+
+#pull out genes associated with a module
+module_df[module_df$label=="ME22",] %>% left_join(eggs, by=c("gene_id"="orf"))
+table(netwk$colors)
+```
+
+```{r DEEP - Top 20 significant modules from WGCNA correlation with season}
+#deep
+#finding hubgenes?
+#which colours (modules) are of interest
+unintcols <- numcol[!numcol$label %in% sigmods, 2]
+#just one gene per hub
+chooseTopHubInEachModule(input_mat, mergedColors, omitColors=unintcols, power=18, type="signed") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("colors") %>% 
+  left_join(numcol[,1:2], by="colors") %>% 
+  left_join(all_annot, by=c("." = "orf"))
+
+top20hubs_deep <- chooseTopHubInEachModule2(input_mat, mergedColors, 
+                                            omitColors=unintcols, 
+                                            power=18,
+                                            type="signed", 
+                                            numTopGenesPerModule = 20) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("order") %>% 
+  pivot_longer(cols=2:ncol(.), 
+               names_to="colors", 
+               values_to="orf") %>% 
+  left_join(numcol[,1:2], by="colors") %>% 
+  left_join(all_annot, by="orf")
+
+#write_tsv(top20hubs_deep, "../data/RNA/inbetween files/top20hubs_deep.tsv")
+```
+
+###INT
+```{r INT - test WGCNA}
+#INT
+#testing WGCNA, tutorial from https://bioinformaticsworkbook.org/dataAnalysis/RNA-Seq/RNA-SeqIntro/wgcna.html#gsc.tab=0
+#to make copy-pasting easier, rename data to input_mat
+#assign("input_mat", norm_counts_deep)
+assign("input_mat", norm_counts_int)
+#assign("input_mat", norm_counts_shal)
+
+#allow WGCNA two threads
+allowWGCNAThreads(2)
+
+# Choose a set of soft-threshold powers
+#powers = c(c(1:10), seq(from = 12, to = 20, by = 2))
+powers2 = c(c(1:10), seq(from =10, to=30, by=1))
+
+```
+
+```{r INT - more WGCNA}
+#INT
+#assign("input_mat", norm_counts_deep)
+#picked_power = 18
+assign("input_mat", norm_counts_int)
+picked_power = 12
+#assign("input_mat", norm_counts_shal)
+#picked_power = 10
+# temp_cor <- cor
+ cor <- WGCNA::cor         # Force it to use WGCNA cor function (fix a namespace conflict issue)
+# 
+ netwk_int <- blockwiseModules(input_mat,                # <= input here
+# 
+#                           # == Adjacency Function ==
+                          power = picked_power,                # <= power here
+                           networkType = "signed",
+ 
+                           # == Tree and Block Options ==
+                           #deepSplit = 2,
+                           #pamRespectsDendro = F,
+                           # detectCutHeight = 0.75,
+                           #minModuleSize = 30,
+                           maxBlockSize = 5000,
+ 
+                           # == Module Adjustments ==
+                           reassignThreshold = 0,
+                           mergeCutHeight = 0.25,
+ 
+                           # == TOM == Archive the run results in TOM file (saves time)
+                           saveTOMs = T,
+                           saveTOMFileBase = "ER",
+ 
+                           # == Output Options
+                           numericLabels = T,
+                           verbose = 3,
+                           randomSeed=42,)
+ 
+ cor <- temp_cor     # Return cor function to original namespace
+
+#Let’s take a look at the modules, there
+
+#assign("netwk", netwk_deep)
+assign("netwk", netwk_int)
+#assign("netwk", netwk_shal)
+
+# Convert labels to colors for plotting
+mergedColors = labels2colors(netwk$colors)
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(
+  netwk$dendrograms[[1]],
+  mergedColors[netwk$blockGenes[[1]]],
+  "Module colors",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05 )
+
+### netwk$colors[netwk$blockGenes[[1]]]
+table(netwk$colors)
+
+###
+#WGCNA results scruitiny
+#We can pull out the list of modules
+
+module_df <- data.frame(
+  gene_id = names(netwk$colors),
+  label = gsub("^", "ME", netwk$colors),
+  colors = labels2colors(netwk$colors)
+  ) %>% remove_rownames()
+
+numcol <- unique(module_df[,2:3])
+
+module_df[1:5,]
+
+#write_delim(module_df, file = "gene_modules_deep.txt", delim = "\t")
+#write_delim(module_df, file = "gene_modules_int.txt", delim = "\t")
+#write_delim(module_df, file = "gene_modules_shal.txt", delim = "\t")
+#We have written out a tab delimited file listing the genes and their modules. However, we need to figure out which modules are associated with each trait/treatment group. WGCNA will calcuate an Eigangene (hypothetical central gene) for each module, so it easier to determine if modules are associated with different treatments
+
+# Get Module Eigengenes per cluster
+MEs0 <- moduleEigengenes(input_mat, mergedColors)$eigengenes
+
+# Reorder modules so similar modules are next to each other
+MEs0 <- orderMEs(MEs0)
+module_order <- names(MEs0) %>% gsub("ME","", .)
+
+# Add treatment names
+MEs0$treatment <- row.names(MEs0)
+
+# tidy & plot data
+mME <- MEs0 %>%
+  pivot_longer(-treatment) %>%
+  mutate(
+    name = gsub("ME", "", name),
+    name = factor(name, levels = module_order)
+  ) %>% 
+  left_join(numcol, by=c("name"="colors"))
+
+mME %>% ggplot(., aes(x=treatment, y=label, fill=value)) +
+  geom_tile() +
+  theme_bw() +
+  scale_fill_gradient2(
+    low = "blue",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limit = c(-1,1)) +
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Module-trait Relationships", y = "Modules", fill="corr")
+
+#orderperseason <- c("A1_march","A2_march","A3_march","A1_june","A2_june","A3_june","A1_october","A2_october","A3_october","A1_december","A2_december","A3_december")
+orderperseason <- c("I1_march","I2_march","I1_june","I3_june","I1_october","I2_october","I3_october","I1_december","I2_december","I3_december")
+#orderperseason <- c("O1_march","O2_march","O3_march","O1_june","O2_june","O3_june","O1_october","O2_october","O3_october","O1_december","O2_december","O3_december")
+
+mME$treatment <- factor(mME$treatment, levels=orderperseason)
+
+forclust <- mME[,-2] %>% pivot_wider(names_from=treatment, values_from=value, values_fill=0) %>% column_to_rownames("label")
+clust <- hclust(dist(forclust))
+
+mME %>% ggplot(., aes(x=treatment, y=label, fill=value)) +
+  geom_tile() +
+  theme_bw() +
+  scale_fill_gradient2(
+    low = "blue",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limit = c(-1,1)) +
+  scale_y_discrete(limits = rownames(forclust)[clust$order]) +
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Ordered per season, intermediate", y = "Modules", fill="corr")
+
+#ggsave("genemodulesperseason_deep.pdf")
+#ggsave("genemodulesperseason_intermediate.pdf")
+#ggsave("genemodulesperseason_shallow.pdf")
+
+```
+
+```{r INT - WGCNA}
+#INT
+#following https://alexslemonade.github.io/refinebio-examples/04-advanced-topics/network-analysis_rnaseq_01_wgcna.html from 4.9 and on
+module_eigengenes <- netwk$MEs
+
+# Print out a preview
+head(module_eigengenes)
+
+#First we double check that our samples are still in order.
+#all.equal(metadata$name[grep('A', metadata$name)], rownames(module_eigengenes))
+all.equal(metadata$name[grep('I', metadata$name)], rownames(module_eigengenes))
+#all.equal(metadata$name[grep('O', metadata$name)], rownames(module_eigengenes))
+
+# Create the design matrix from the `date` variable
+#des_mat <- model.matrix(~ metadata[grep('A', metadata$name),]$season)
+des_mat <- model.matrix(~ metadata[grep('I', metadata$name),]$season)
+#des_mat <- model.matrix(~ metadata[grep('O', metadata$name),]$season)
+
+colnames(des_mat) <- c("(Intercept)", "spring", "summer", "winter")
+
+#Run linear model on each module. Limma wants our tests to be per row, so we also need to transpose so the eigengenes are rows
+# lmFit() needs a transposed version of the matrix
+fit <- limma::lmFit(t(module_eigengenes), design = des_mat)
+
+# Apply empirical Bayes to smooth standard errors
+fit <- limma::eBayes(fit)
+
+# Apply multiple testing correction and obtain stats
+stats_df <- limma::topTable(fit, number = ncol(module_eigengenes)) %>%
+  tibble::rownames_to_column("module")
+
+head(stats_df)
+
+module_eigeng_df <- module_eigengenes %>%
+  tibble::rownames_to_column("name") %>%
+  # Here we are performing an inner join with a subset of metadata
+  dplyr::inner_join(metadata %>% dplyr::select(name, season),  by = "name")
+
+#assign("module_eigeng_df_deep", module_eigeng_df)
+#assign("stats_df_deep", stats_df)
+assign("module_eigeng_df_int", module_eigeng_df)
+assign("stats_df_int", stats_df)
+#assign("module_eigeng_df_shal", module_eigeng_df)
+#assign("stats_df_shal", stats_df)
+
+ggplot(
+  module_eigeng_df,
+  aes(x = season, y = ME2)) +
+  geom_point() +
+  theme_classic()
+
+```
+
+```{r INT - WGCNA correlated with season}
+#INT
+#from interwebs: https://wikis.utexas.edu/display/bioiteam/Clustering+using+WGCNA
+# Correlate traits --------------------------------------------------------
+ 
+ 
+#Define number of genes and samples
+nGenes = ncol(input_mat)
+nSamples = nrow(input_mat)
+#Recalculate MEs with color labels
+#MEs0 = moduleEigengenes(input_mat, mergedColors)$eigengenes #done previously
+#MEs0 = orderMEs(MEs0) #done previously
+#getting the traits we want to look at
+#replace in grep, A/I/O
+traits <- metadata[grep('I', metadata$name),] %>%
+  column_to_rownames("name") %>%
+  mutate(
+    march=case_when(
+      season == "Spring" ~ 1,
+      TRUE               ~ 0
+    ),
+    june=case_when(
+      season == "Summer" ~ 1,
+      TRUE               ~ 0
+    ),
+    october=case_when(
+      season == "Fall" ~ 1,
+      TRUE               ~ 0
+    ),
+    december=case_when(
+      season == "Winter" ~ 1,
+      TRUE               ~ 0
+    )
+  ) %>% 
+  select(c("march", "june", "october", "december"))
+#only use the months to compare with the limma model, not: "oxygen1", "temperature", "sulfate", "organicmatter", "phosphate", "total iron", "pH", "nitrate"
+
+numcol$colors2 <- gsub("^", "ME", numcol$colors)
+
+MEs02 <- t(select(MEs0, -"treatment")) %>% as.data.frame() %>% rownames_to_column("colors2") %>% left_join(numcol, by="colors2") %>% column_to_rownames("label") %>% select(-c("colors", "colors2")) %>% t() %>% as.data.frame()
+
+#change columns
+moduleTraitCor <- WGCNA::cor(MEs02, traits, use="p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples)
+
+#filter data based on p-value
+moduleTraitPvalue[moduleTraitPvalue>0.05] <- NA
+moduleTraitPvalue <- moduleTraitPvalue[rowSums(is.na(moduleTraitPvalue)) != ncol(moduleTraitPvalue),]
+
+moduleTraitCor <- moduleTraitCor[rownames(moduleTraitCor) %in% rownames(moduleTraitPvalue),]
+moduleTraitCor[is.na(moduleTraitPvalue)] <- NA
+
+#Print correlation heatmap between modules and traits
+textMatrix= paste(signif(moduleTraitCor, 2), "\n(",
+                        signif(moduleTraitPvalue, 1), ")", sep= "")
+dim(textMatrix)= dim(moduleTraitCor)
+colnames(textMatrix) <- colnames(moduleTraitCor)
+rownames(textMatrix) <- rownames(moduleTraitCor)
+textMatrix <- gsub("\\\n\\(NA\\)", "", textMatrix)
+ 
+#moduleTraitCor <- moduleTraitCor %>% as.data.frame() %>% rownames_to_column(var="colors") %>% gsub_v("ME", "", .) %>% as.data.frame() %>% setNames(., c("colors", "march", "june", "october", "december")) %>% left_join(numcol, by="colors") %>% column_to_rownames("label") %>% select(-"colors")
+
+#display the corelation values with a heatmap plot
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+#pdf(file="heatmap_traits_int.pdf")
+labeledHeatmap(Matrix= moduleTraitCor,
+            xLabels= names(traits),
+            yLabels= rownames(moduleTraitCor),
+            ySymbols= rownames(moduleTraitCor),
+            #colorLabels= TRUE,
+            colors= blueWhiteRed(50),
+            textMatrix= textMatrix,
+            setStdMargins= FALSE,
+            cex.text= 0.5,
+            zlim= c(-1,1),
+            main= paste("Module-trait relationships"))
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+#dev.off()
+
+#look at what modules are identified by both this approach and the limma approach
+sigmods <- moduleTraitCor %>% as.data.frame() %>% rownames_to_column(var="module") %>% right_join(stats_df[stats_df$adj.P.Val<0.05,], by="module") %>% select(module) %>% unname() %>% as.vector() %>% unlist()
+
+#intermediate, 9 modules: 1, 2, 3, 4, 6, 12, 14, 19, 21
+
+#pull out genes associated with a module
+module_df[module_df$label=="ME21",] %>% left_join(kofam, by=c("gene_id"="orf"))
+table(netwk$colors)
+
+
+```
+
+```{r INT - Top 20 significant modules from WGCNA correlation with season}
+#int
+#finding hubgenes?
+#which colours (modules) are of interest
+unintcols <- numcol[!numcol$label %in% sigmods, 2]
+#unintcols <- numcol[!numcol$label %in% c("ME2", "ME6"), 2]
+#just one gene per hub
+chooseTopHubInEachModule(input_mat, mergedColors, omitColors=unintcols, power=12, type="signed") %>% as.data.frame() %>% rownames_to_column("colors") %>% left_join(numcol[,1:2], by="colors") %>% left_join(all_annot, by=c("." = "orf"))
+
+top20hubs_int <- chooseTopHubInEachModule2(input_mat, mergedColors, omitColors=unintcols, power=12, type="signed", numTopGenesPerModule = 20) %>% as.data.frame() %>% rownames_to_column("order") %>% pivot_longer(cols=2:ncol(.), names_to="colors", values_to="orf") %>% left_join(numcol[,1:2], by="colors") %>% left_join(all_annot, by="orf")
+
+#write_tsv(top20hubs_int, "../data/RNA/inbetween files/top20hubs_int.tsv")
+```
+
+##SHAL
+```{r SHAL - test WGCNA}
+#SHAL
+#testing WGCNA, tutorial from https://bioinformaticsworkbook.org/dataAnalysis/RNA-Seq/RNA-SeqIntro/wgcna.html#gsc.tab=0
+#to make copy-pasting easier, rename data to input_mat
+#assign("input_mat", norm_counts_deep)
+#assign("input_mat", norm_counts_int)
+assign("input_mat", norm_counts_shal)
+
+#allow WGCNA two threads
+allowWGCNAThreads(2)
+
+# Choose a set of soft-threshold powers
+#powers = c(c(1:10), seq(from = 12, to = 20, by = 2))
+powers2 = c(c(1:10), seq(from =10, to=30, by=1))
+
+
+```
+
+```{r SHAL - more WGCNA}
+#SHAL
+#assign("input_mat", norm_counts_deep)
+#picked_power = 18
+#assign("input_mat", norm_counts_int)
+#picked_power = 12
+assign("input_mat", norm_counts_shal)
+picked_power = 10
+ temp_cor <- cor
+ cor <- WGCNA::cor         # Force it to use WGCNA cor function (fix a namespace conflict issue)
+# 
+ netwk_shal <- blockwiseModules(input_mat,                # <= input here
+                           # == Adjacency Function ==
+                           power = picked_power,                # <= power here
+                           networkType = "signed",
+                           # == Tree and Block Options ==
+                           #deepSplit = 2,
+                           #pamRespectsDendro = F,
+                           # detectCutHeight = 0.75,
+                          #minModuleSize = 30,
+                           maxBlockSize = 5000,
+                          
+                           # == Module Adjustments ==
+                           reassignThreshold = 0,
+                           mergeCutHeight = 0.25,
+ 
+                           # == TOM == Archive the run results in TOM file (saves time)
+                           saveTOMs = T,
+                           saveTOMFileBase = "ER",
+                           # == Output Options
+                           numericLabels = T,
+                           verbose = 3,
+                           randomSeed=42,)
+
+  cor <- temp_cor     # Return cor function to original namespace
+
+#Let’s take a look at the modules, there
+
+#assign("netwk", netwk_deep)
+#assign("netwk", netwk_int)
+assign("netwk", netwk_shal)
+
+# Convert labels to colors for plotting
+mergedColors = labels2colors(netwk$colors)
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(
+  netwk$dendrograms[[1]],
+  mergedColors[netwk$blockGenes[[1]]],
+  "Module colors",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05 )
+
+### netwk$colors[netwk$blockGenes[[1]]]
+table(netwk$colors)
+
+#deep 50-smth clusters, clusters until 31 >100, until 7 >500
+#int 30-smth clusters, clusters until 20 >100, until 5 >500
+#shal 30-smth clusters, clusters until 26 >100, until 10 >500
+
+###
+#WGCNA results scruitiny
+#We can pull out the list of modules
+
+module_df <- data.frame(
+  gene_id = names(netwk$colors),
+  label = gsub("^", "ME", netwk$colors),
+  colors = labels2colors(netwk$colors)
+  ) %>% remove_rownames()
+
+numcol <- unique(module_df[,2:3])
+
+module_df[1:5,]
+
+#write_delim(module_df, file = "gene_modules_deep.txt", delim = "\t")
+#write_delim(module_df, file = "gene_modules_int.txt", delim = "\t")
+#write_delim(module_df, file = "gene_modules_shal.txt", delim = "\t")
+#We have written out a tab delimited file listing the genes and their modules. However, we need to figure out which modules are associated with each trait/treatment group. WGCNA will calcuate an Eigangene (hypothetical central gene) for each module, so it easier to determine if modules are associated with different treatments
+
+# Get Module Eigengenes per cluster
+MEs0 <- moduleEigengenes(input_mat, mergedColors)$eigengenes
+
+# Reorder modules so similar modules are next to each other
+MEs0 <- orderMEs(MEs0)
+module_order <- names(MEs0) %>% gsub("ME","", .)
+
+# Add treatment names
+MEs0$treatment <- row.names(MEs0)
+
+# tidy & plot data
+mME <- MEs0 %>%
+  pivot_longer(-treatment) %>%
+  mutate(
+    name = gsub("ME", "", name),
+    name = factor(name, levels = module_order)
+  ) %>% 
+  left_join(numcol, by=c("name"="colors"))
+
+mME %>% ggplot(., aes(x=treatment, y=label, fill=value)) +
+  geom_tile() +
+  theme_bw() +
+  scale_fill_gradient2(
+    low = "blue",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limit = c(-1,1)) +
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Module-month Relationships, shallow", y = "Modules", fill="corr")
+
+#orderperseason <- c("A1_march","A2_march","A3_march","A1_june","A2_june","A3_june","A1_october","A2_october","A3_october","A1_december","A2_december","A3_december")
+#orderperseason <- c("I1_march","I2_march","I1_june","I3_june","I1_october","I2_october","I3_october","I1_december","I2_december","I3_december")
+orderperseason <- c("O1_march","O2_march","O3_march","O1_june","O2_june","O3_june","O1_october","O2_october","O3_october","O1_december","O2_december","O3_december")
+
+mME$treatment <- factor(mME$treatment, levels=orderperseason)
+
+forclust <- mME[,-2] %>% pivot_wider(names_from=treatment, values_from=value, values_fill=0) %>% column_to_rownames("label")
+clust <- hclust(dist(forclust))
+
+mME %>% ggplot(., aes(x=treatment, y=label, fill=value)) +
+  geom_tile() +
+  theme_bw() +
+  scale_fill_gradient2(
+    low = "blue",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limit = c(-1,1)) +
+  scale_y_discrete(limits = rownames(forclust)[clust$order]) +
+  theme(axis.text.x = element_text(angle=90)) +
+  labs(title = "Ordered per season, shallow", y = "Modules", fill="corr")
+
+#ggsave("genemodulesperseason_deep.pdf")
+#ggsave("genemodulesperseason_intermediate.pdf")
+#ggsave("genemodulesperseason_shallow.pdf")
+
+```
+
+```{r SHAL - WGCNA}
+#SHAL
+#following https://alexslemonade.github.io/refinebio-examples/04-advanced-topics/network-analysis_rnaseq_01_wgcna.html from 4.9 and on
+module_eigengenes <- netwk$MEs
+
+# Print out a preview
+head(module_eigengenes)
+
+#First we double check that our samples are still in order.
+#all.equal(metadata$name[grep('A', metadata$name)], rownames(module_eigengenes))
+#all.equal(metadata$name[grep('I', metadata$name)], rownames(module_eigengenes))
+all.equal(metadata$name[grep('O', metadata$name)], rownames(module_eigengenes))
+
+# Create the design matrix from the `date` variable
+#des_mat <- model.matrix(~ metadata[grep('A', metadata$name),]$season)
+#des_mat <- model.matrix(~ metadata[grep('I', metadata$name),]$season)
+des_mat <- model.matrix(~ metadata[grep('O', metadata$name),]$season)
+
+colnames(des_mat) <- c("(Intercept)", "spring", "summer", "winter")
+
+#Run linear model on each module. Limma wants our tests to be per row, so we also need to transpose so the eigengenes are rows
+# lmFit() needs a transposed version of the matrix
+fit <- limma::lmFit(t(module_eigengenes), design = des_mat)
+
+# Apply empirical Bayes to smooth standard errors
+fit <- limma::eBayes(fit)
+
+# Apply multiple testing correction and obtain stats
+stats_df <- limma::topTable(fit, number = ncol(module_eigengenes)) %>%
+  tibble::rownames_to_column("module")
+
+head(stats_df)
+
+module_eigeng_df <- module_eigengenes %>%
+  tibble::rownames_to_column("name") %>%
+  # Here we are performing an inner join with a subset of metadata
+  dplyr::inner_join(metadata %>% dplyr::select(name, season),  by = "name")
+
+#assign("module_eigeng_df_deep", module_eigeng_df)
+#assign("stats_df_deep", stats_df)
+#assign("module_eigeng_df_int", module_eigeng_df)
+#assign("stats_df_int", stats_df)
+assign("module_eigeng_df_shal", module_eigeng_df)
+assign("stats_df_shal", stats_df)
+
+ggplot(
+  module_eigeng_df,
+  aes(x = season, y = ME5)) +
+  geom_point() +
+  theme_classic()
+
+```
+
+```{r SHAL - WGCNA correlated with season}
+#SHAL
+#from interwebs: https://wikis.utexas.edu/display/bioiteam/Clustering+using+WGCNA
+# Correlate traits --------------------------------------------------------
+ 
+#Define number of genes and samples
+nGenes = ncol(input_mat)
+nSamples = nrow(input_mat)
+#Recalculate MEs with color labels
+#MEs0 = moduleEigengenes(input_mat, mergedColors)$eigengenes #done previously
+#MEs0 = orderMEs(MEs0) #done previously
+#getting the traits we want to look at
+#replace in grep, A/I/O
+traits <- metadata[grep('O', metadata$name),] %>%
+  column_to_rownames("name") %>%
+  mutate(
+    march=case_when(
+      season == "Spring" ~ 1,
+      TRUE               ~ 0
+    ),
+    june=case_when(
+      season == "Summer" ~ 1,
+      TRUE               ~ 0
+    ),
+    october=case_when(
+      season == "Fall" ~ 1,
+      TRUE               ~ 0
+    ),
+    december=case_when(
+      season == "Winter" ~ 1,
+      TRUE               ~ 0
+    )
+  ) %>% 
+  select(c("march", "june", "october", "december"))
+#only use the months to compare with the limma model, not: "oxygen1", "temperature", "sulfate", "organicmatter", "phosphate", "total iron", "pH", "nitrate"
+
+numcol$colors2 <- gsub("^", "ME", numcol$colors)
+
+MEs02 <- t(select(MEs0, -"treatment")) %>% as.data.frame() %>% rownames_to_column("colors2") %>% left_join(numcol, by="colors2") %>% column_to_rownames("label") %>% select(-c("colors", "colors2")) %>% t() %>% as.data.frame()
+
+#change columns
+moduleTraitCor <- WGCNA::cor(MEs02, traits, use="p")
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples)
+
+#filter data based on p-value
+moduleTraitPvalue[moduleTraitPvalue>0.05] <- NA
+moduleTraitPvalue <- moduleTraitPvalue[rowSums(is.na(moduleTraitPvalue)) != ncol(moduleTraitPvalue),]
+
+moduleTraitCor <- moduleTraitCor[rownames(moduleTraitCor) %in% rownames(moduleTraitPvalue),]
+moduleTraitCor[is.na(moduleTraitPvalue)] <- NA
+
+#Print correlation heatmap between modules and traits
+textMatrix= paste(signif(moduleTraitCor, 2), "\n(",
+                        signif(moduleTraitPvalue, 1), ")", sep= "")
+dim(textMatrix)= dim(moduleTraitCor)
+colnames(textMatrix) <- colnames(moduleTraitCor)
+rownames(textMatrix) <- rownames(moduleTraitCor)
+textMatrix <- gsub("\\\n\\(NA\\)", "", textMatrix)
+
+#moduleTraitCor <- moduleTraitCor %>% as.data.frame() %>% rownames_to_column(var="colors") %>% gsub_v("ME", "", .) %>% as.data.frame() %>% setNames(., c("colors", "march", "june", "october", "december")) %>% left_join(numcol, by="colors") %>% column_to_rownames("label") %>% select(-"colors")
+
+#display the corelation values with a heatmap plot
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+#pdf(file="heatmap_traits_int.pdf")
+labeledHeatmap(Matrix= moduleTraitCor,
+            xLabels= names(traits),
+            yLabels= rownames(moduleTraitCor),
+            ySymbols= rownames(moduleTraitCor),
+            #colorLabels= TRUE,
+            colors= blueWhiteRed(50),
+            textMatrix= textMatrix,
+            setStdMargins= FALSE,
+            cex.text= 0.5,
+            zlim= c(-1,1),
+            main= paste("Module-month relationships, shallow"))
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+#dev.off()
+
+#look at what modules are identified by both this approach and the limma approach
+sigmods <- moduleTraitCor %>% as.data.frame() %>% rownames_to_column(var="module") %>% right_join(stats_df[stats_df$adj.P.Val<0.05,], by="module") %>% select(module) %>% unname() %>% as.vector() %>% unlist()
+
+#adjust modules based on res above
+#shallow, 9 modules: 1, 2, 3, 4, 5, 7, 8, 19, 24
+
+#pull out genes associated with a module
+module_df[module_df$label=="ME19",] %>% left_join(kofam, by=c("gene_id"="orf"))
+table(netwk$colors)
+
+
+```
+
+```{r SHAL - TOP 20 significant modules from WGCNA correlation with season}
+#shal
+#finding hubgenes?
+#which colours (modules) are of interest
+unintcols <- numcol[!numcol$label %in% sigmods, 2]
+#just one gene per hub
+chooseTopHubInEachModule(input_mat, mergedColors, omitColors=unintcols, power=10, type="signed") %>% as.data.frame() %>% rownames_to_column("colors") %>% left_join(numcol[,1:2], by="colors") %>% left_join(all_annot, by=c("." = "orf"))
+
+top20hubs_shal <- chooseTopHubInEachModule2(input_mat, mergedColors, omitColors=unintcols, power=10, type="signed", numTopGenesPerModule = 20) %>% as.data.frame() %>% rownames_to_column("order") %>% pivot_longer(cols=2:ncol(.), names_to="colors", values_to="orf") %>% left_join(numcol[,1:2], by="colors") %>% left_join(all_annot, by="orf")
+
+#write_tsv(top20hubs_shal, "../data/RNA/inbetween files/top20hubs_shal.tsv")
+```
+
+
+```{r combine 3 sites for figure 8}
+#put together the time plots for res
+ggarrange(CD, CI, CS, labels=c("A", "B", "C"))
+#ggsave("../figure/Figure_jpg/fig8_modules_overtime3.tiff", width=180, unit="mm", dpi=300)
+#height=300,
+```
+
+```{r combine top20 hub genes - supplemental table S4}
+#shall_top <- read_tsv("../data/RNA/inbetween files/top20hubs_shal.tsv")
+#int_top <- read_tsv("../data/RNA/inbetween files/top20hubs_int.tsv")
+#deep_top <-read_tsv("../data/RNA/inbetween files/top20hubs_deep.tsv")
+
+#combine tables
+#df_all <- bind_rows(
+#  shall_top %>% mutate(site = "Shallow"),
+ # int_top %>% mutate(site = "Intermediate"),
+ # deep_top %>% mutate(site = "Deep")
+#)
+
+#reduce infos and table size, from 39 columns to 11
+#df_clean <- df_all %>%
+#  select(
+#    site,
+ #   orf,
+ #   label,
+  #  preferred_name,
+ #   description,
+  #  score.x,
+  #  evalue.x,
+  #  kegg_ko,
+  #  cog_category,
+  #  phylum,
+  #  genus
+ # )
+
+#get rid of NA
+#df_clean <- df_clean %>%
+ # filter(!is.na(preferred_name))
+
+#keep only informative genes
+#df_clean <- df_clean %>%
+  #filter(!is.na(kegg_ko) | !is.na(preferred_name))
+
+#make it compact
+#df_final <- df_clean %>%
+ # mutate(short_desc = substr(description, 1, 80)) %>%
+ # select(site, orf, preferred_name, short_desc, kegg_ko)
+
+#write.csv(df_final, "../figure/Supplemental_data/TableS4_Top20hubgenes_ident_WGCNA.csv")
+
+#Summary
+#df_summary <- df_clean %>%
+#  group_by(site, preferred_name) %>%
+#  summarise(
+  #  n_genes = n(),
+   # .groups = "drop"
+#  )
+
+#write.csv(df_summary, "../figure/Supplemental_data/TableS4_summary.csv")
+```
+
+
+```{r session Info}
+sessionInfo()
+```
+
